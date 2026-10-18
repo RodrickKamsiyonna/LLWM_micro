@@ -14,6 +14,8 @@ loss = ce_weight * CE(logits[t+1], x[t+1])
      + kl_weight * KL(q(a[t]) || Normal(0, I))
 ```
 
+The action encoder receives detached copies of both `m[t]` and the next-token embedding. Its weights still learn through the sampled action and KL loss, but this branch cannot update the compressor or shared embeddings. The original `m[t]` remains connected to the predictor, so the compressor and its embeddings learn through that direct memory path. The next-memory MSE target is also detached.
+
 KL sums action dimensions and averages transitions. MSE averages memory dimensions and transitions. CE averages transitions. The default weights are CE=1, MSE=1, KL=0.001. The action encoder must receive the **next** token: the current token is already represented in `m[t]`. Predicted next memory is compared to detached next memory, not current memory.
 
 ## Run on two T4 GPUs

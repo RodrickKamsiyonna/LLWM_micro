@@ -46,6 +46,34 @@ class WorldModelTests(unittest.TestCase):
             self.assertIsNotNone(p.grad, name)
             self.assertTrue(torch.isfinite(p.grad).all(), name)
 
+    def test_action_encoder_detaches_inputs_but_trains_its_weights(self):
+        memory = self.model.compress(self.tokens)[:, :-1]
+        memory.retain_grad()
+        mu, log_std = self.model.posterior(memory, self.tokens[:, 1:])
+        (mu.square().mean() + log_std.square().mean()).backward()
+        self.assertIsNone(memory.grad)
+        for module in [self.model.embedding, self.model.position, self.model.compressor]:
+            for p in module.parameters():
+                self.assertIsNone(p.grad)
+        for p in self.model.action_encoder.parameters():
+            self.assertIsNotNone(p.grad)
+            self.assertTrue(torch.isfinite(p.grad).all())
+            self.assertGreater(p.grad.abs().sum().item(), 0.)
+
+    def test_memory_gradient_comes_only_from_direct_predictor_input(self):
+        memory = self.model.compress(self.tokens)[:, :-1]
+        mu, log_std = self.model.posterior(memory, self.tokens[:, 1:])
+        action = mu + log_std.exp() * torch.randn_like(mu)
+        predicted = self.model.transition(memory, action)
+        loss = F.cross_entropy(self.model.head(predicted).flatten(0, 1), self.tokens[:, 1:].flatten())
+        actual, = torch.autograd.grad(loss, memory)
+        direct_memory = memory.detach().requires_grad_()
+        direct_predicted = self.model.transition(direct_memory, action.detach())
+        direct_loss = F.cross_entropy(self.model.head(direct_predicted).flatten(0, 1), self.tokens[:, 1:].flatten())
+        expected, = torch.autograd.grad(direct_loss, direct_memory)
+        torch.testing.assert_close(actual, expected)
+        self.assertGreater(actual.abs().sum().item(), 0.)
+
     def test_planning_changes_actions_not_weights_and_restores_flags(self):
         before = {k: v.clone() for k, v in self.model.state_dict().items()}
         self.model.embedding.weight.requires_grad_(False)

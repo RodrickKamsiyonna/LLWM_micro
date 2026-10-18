@@ -67,7 +67,9 @@ class WorldModel(nn.Module):
         return self.compressor(self.embedding(tokens) + self.position(torch.arange(tokens.size(1), device=tokens.device)))
 
     def posterior(self, memory, token):
-        mu, log_std = self.action_encoder(torch.cat((memory, self.embedding(token)), -1)).chunk(2, -1)
+        # Train the encoder without sending its gradients into either input source.
+        inputs = torch.cat((memory.detach(), self.embedding(token).detach()), -1)
+        mu, log_std = self.action_encoder(inputs).chunk(2, -1)
         return mu, log_std.clamp(-5, 2)
 
     def transition(self, memory, action):
