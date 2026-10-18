@@ -8,16 +8,15 @@ For characters `x[0:T+1]`, the compressor produces `m[0:T+1]`. Each `m[t]` has a
 q(a[t] | m[t], x[t+1]) = Normal(mu, exp(log_std))
 a[t] = mu + exp(log_std) * epsilon
 predicted_m[t+1] = predictor(m[t], a[t])
-logits[t+1] = head(predicted_m[t+1])
-loss = ce_weight * CE(logits[t+1], x[t+1])
-     + compressor_ce_weight * CE(head(m[t]), x[t+1])
+logits[t+1] = head(m[t])
+loss = compressor_ce_weight * CE(logits[t+1], x[t+1])
      + mse_weight * MSE(predicted_m[t+1], stop_gradient(m[t+1]))
      + kl_weight * KL(q(a[t]) || Normal(0, I))
 ```
 
-The action encoder receives detached copies of both `m[t]` and the next-token embedding. Its weights still learn through the sampled action and KL loss, but this branch cannot update the compressor or shared embeddings. The original `m[t]` remains connected to the predictor, so the compressor and its embeddings learn through that direct memory path. The additional compressor CE also trains the compressor and shared embeddings directly through the shared LLM head. The next-memory MSE target is also detached.
+The action encoder receives detached copies of both `m[t]` and the next-token embedding. Its weights still learn through memory MSE via the sampled action and through KL loss, but this branch cannot update the compressor or shared embeddings. The original `m[t]` remains connected to the predictor, so the compressor and its embeddings learn through that direct memory path. Compressor CE trains the compressor and shared embeddings directly through the shared LLM head. The next-memory MSE target is also detached.
 
-KL sums action dimensions and averages transitions. MSE averages memory dimensions and transitions. CE averages transitions. The default weights are predictor CE=1, compressor CE=1, MSE=1, KL=0.001. Set `--compressor-ce-weight` to change the new weight, or to `0` to disable its contribution. W&B logs it separately as `train/compressor_ce` and `val/compressor_ce`; `train/ce` and `val/ce` retain the predictor-based CE. The action encoder must receive the **next** token: the current token is already represented in `m[t]`. Predicted next memory is compared to detached next memory, not current memory.
+KL sums action dimensions and averages transitions. MSE averages memory dimensions and transitions. CE averages transitions. The default weights are compressor CE=1, MSE=1, KL=0.001. During training the head is applied only to compressor memories; predictor outputs are supervised by memory MSE, with no predictor CE term or `--ce-weight` setting. Set `--compressor-ce-weight` to change its weight, or to `0` to disable its contribution. W&B logs it separately as `train/compressor_ce` and `val/compressor_ce`. The obsolete predictor CE metrics `train/ce` and `val/ce` are no longer logged. The action encoder must receive the **next** token: the current token is already represented in `m[t]`. Predicted next memory is compared to detached next memory, not current memory.
 
 ## Run on two T4 GPUs
 
@@ -38,11 +37,11 @@ Defaults: 20,000 optimizer steps, context 256, width 256, four compressor layers
 
 Every 500 optimizer steps (and at the final step), validation and planning run. Checkpoints are saved every 500 steps, on validation improvement, and at the end. Numbered checkpoint files retain history; `latest.pt` and `best.pt` point to the relevant files. Resume with the same model/data/training arguments and `--resume checkpoints/latest.pt`. Checkpoints restore model, AdamW, scaler, step, best validation loss, vocabulary, W&B ID, and per-rank Python/NumPy/Torch/CUDA RNG state. Keep world size unchanged for RNG continuity. Keep total `--steps` unchanged to preserve the learning-rate schedule. Only load trusted checkpoints.
 
-W&B logs total loss, raw predictor CE/compressor CE/MSE/KL, learning rate, gradient norm, validation losses, planning objective history, and a table of generated text. `--wandb-mode offline` records locally; `--wandb-mode disabled` needs no account. Planning results also go to `checkpoints/plan_STEP.json`.
+W&B logs total loss, raw compressor CE/MSE/KL, learning rate, gradient norm, validation losses, planning objective history, and a table of generated text. `--wandb-mode offline` records locally; `--wandb-mode disabled` needs no account. Planning results also go to `checkpoints/plan_STEP.json`.
 
 ## Planning semantics
 
-The prompt is compressed once to the last causal memory. Initialize **500 actions total** from the unit Gaussian prior. Freeze all model weights and optimize only these actions through the entire recursive predictor rollout. Model dropout is disabled. Neither the compressor nor the action encoder runs inside the optimization loop. The action encoder is used only during training.
+The prompt is compressed once to the last causal memory. Initialize **500 actions total** from the unit Gaussian prior. Freeze all model weights and optimize only these actions through the entire recursive predictor rollout. Model dropout is disabled. Neither the compressor nor the action encoder runs inside the optimization loop. The action encoder is used only during training. Planning still applies the frozen head to predicted memories to score the goal; this planning objective is separate from the training loss.
 
 The goal string (default `" ."`) is used **only as a cross-entropy target** for the final `len(goal)` positions of the 500-token rollout. No goal character or its embedding is fed into any module. All goal positions are reached using optimized actions and recursively predicted memories. Multi-character goals are scored jointly on that same free rollout, with no teacher forcing.
 
@@ -78,4 +77,4 @@ python train.py --device cpu --wandb-mode disabled --steps 2 \
   --eval-batches 1 --plan-horizon 4 --plan-iterations 2
 ```
 
-Local verification used PyTorch 2.2.2, NumPy 1.26.4, and W&B 0.18.7 on an Intel Mac (newer PyTorch wheels are unavailable for that platform). All eight unit tests passed, including compressor CE alignment, weighting, and gradient routing. A two-process CPU/Gloo run completed training, validation, planning, and checkpoint saving. Offline W&B produced both nonempty tables. Resuming step 1 exactly reproduced step 2 model/optimizer/scaler/RNG state, validation loss, and planning JSON. A 500-action CPU planning smoke check completed with decreasing objective. CUDA FP16 and NCCL execution on T4 GPUs remain unverified here; the requirements target PyTorch 2.4+ for the GPU run.
+Local verification used PyTorch 2.2.2, NumPy 1.26.4, and W&B 0.18.7 on an Intel Mac (newer PyTorch wheels are unavailable for that platform). All nine unit tests passed, including compressor CE alignment, weighting, and gradient routing. A two-process CPU/Gloo run completed training, validation, planning, and checkpoint saving. Offline W&B produced both nonempty tables. Resuming step 1 exactly reproduced step 2 model/optimizer/scaler/RNG state, validation loss, and planning JSON. A 500-action CPU planning smoke check completed with decreasing objective. CUDA FP16 and NCCL execution on T4 GPUs remain unverified here; the requirements target PyTorch 2.4+ for the GPU run.

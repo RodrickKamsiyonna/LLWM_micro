@@ -36,7 +36,6 @@ def arguments():
     p.add_argument('--warmup', type=int, default=200)
     p.add_argument('--kl-weight', type=float, default=0.001)
     p.add_argument('--mse-weight', type=float, default=1.)
-    p.add_argument('--ce-weight', type=float, default=1.)
     p.add_argument('--compressor-ce-weight', type=float, default=1.)
     p.add_argument('--eval-every', type=int, default=500)
     p.add_argument('--save-every', type=int, default=500)
@@ -149,18 +148,18 @@ def main():
                              id=run_id, resume='allow' if run_id else None, settings=settings)
         print(f'{sum(p.numel() for p in raw.parameters()):,} parameters; effective batch {args.batch_size*args.accumulation*world}', flush=True)
     def reduced(values):
-        v = torch.stack([values[k].detach().float() for k in ['loss', 'ce', 'compressor_ce', 'mse', 'kl']])
+        v = torch.stack([values[k].detach().float() for k in ['loss', 'compressor_ce', 'mse', 'kl']])
         if world > 1:
             dist.all_reduce(v)
             v /= world
-        return dict(zip(['loss', 'ce', 'compressor_ce', 'mse', 'kl'], v.tolist()))
+        return dict(zip(['loss', 'compressor_ce', 'mse', 'kl'], v.tolist()))
     def evaluate():
         raw.eval()
-        totals = {k: torch.zeros((), device=device) for k in ['loss', 'ce', 'compressor_ce', 'mse', 'kl']}
+        totals = {k: torch.zeros((), device=device) for k in ['loss', 'compressor_ce', 'mse', 'kl']}
         with torch.no_grad():
             for _ in range(args.eval_batches):
                 with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=cuda):
-                    values = raw(batch('val'), args.kl_weight, args.mse_weight, args.ce_weight, args.compressor_ce_weight)
+                    values = raw(batch('val'), args.kl_weight, args.mse_weight, args.compressor_ce_weight)
                 for k in totals:
                     totals[k] += values[k] / args.eval_batches
         raw.train()
@@ -195,12 +194,12 @@ def main():
         for group in optimizer.param_groups:
             group['lr'] = lr
         optimizer.zero_grad(set_to_none=True)
-        totals = {k: torch.zeros((), device=device) for k in ['loss', 'ce', 'compressor_ce', 'mse', 'kl']}
+        totals = {k: torch.zeros((), device=device) for k in ['loss', 'compressor_ce', 'mse', 'kl']}
         for micro in range(args.accumulation):
             sync = model.no_sync() if world > 1 and micro < args.accumulation-1 else nullcontext()
             with sync:
                 with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=cuda):
-                    values = model(batch('train'), args.kl_weight, args.mse_weight, args.ce_weight, args.compressor_ce_weight)
+                    values = model(batch('train'), args.kl_weight, args.mse_weight, args.compressor_ce_weight)
                 if not torch.isfinite(values['loss']):
                     raise RuntimeError(f'nonfinite loss at step {step}')
                 scaler.scale(values['loss']/args.accumulation).backward()
