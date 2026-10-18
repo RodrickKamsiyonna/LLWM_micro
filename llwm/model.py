@@ -77,13 +77,15 @@ class WorldModel(nn.Module):
             memory = block(memory, action)
         return self.predictor_norm(memory)
 
-    def forward(self, tokens, kl_weight=0.001, mse_weight=1., ce_weight=1.):
+    def forward(self, tokens, kl_weight=0.001, mse_weight=1., ce_weight=1., compressor_ce_weight=1.):
         memories = self.compress(tokens)
         current, target = memories[:, :-1], memories[:, 1:].detach()
         mu, log_std = self.posterior(current, tokens[:, 1:])
         action = mu + log_std.exp() * torch.randn_like(mu)
         predicted = self.transition(current, action)
         ce = F.cross_entropy(self.head(predicted).float().flatten(0, 1), tokens[:, 1:].flatten())
+        compressor_ce = F.cross_entropy(self.head(current).float().flatten(0, 1), tokens[:, 1:].flatten())
         mse = F.mse_loss(predicted.float(), target.float())
         kl = 0.5 * (mu.float().square() + (2*log_std.float()).exp() - 1 - 2*log_std.float()).sum(-1).mean()
-        return {'loss': ce_weight*ce + mse_weight*mse + kl_weight*kl, 'ce': ce, 'mse': mse, 'kl': kl}
+        return {'loss': ce_weight*ce + mse_weight*mse + kl_weight*kl + compressor_ce_weight*compressor_ce,
+                'ce': ce, 'compressor_ce': compressor_ce, 'mse': mse, 'kl': kl}

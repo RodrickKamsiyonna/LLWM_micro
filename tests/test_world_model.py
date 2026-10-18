@@ -34,6 +34,8 @@ class WorldModelTests(unittest.TestCase):
         predicted = self.model.transition(memory[:, :-1], mu + log_std.exp()*torch.randn_like(mu))
         expected = F.cross_entropy(self.model.head(predicted).flatten(0, 1), self.tokens[:, 1:].flatten())
         torch.testing.assert_close(expected, values['ce'])
+        expected_compressor_ce = F.cross_entropy(self.model.head(memory[:, :-1]).flatten(0, 1), self.tokens[:, 1:].flatten())
+        torch.testing.assert_close(values['compressor_ce'], expected_compressor_ce)
         torch.testing.assert_close(values['mse'], F.mse_loss(predicted, memory[:, 1:].detach()))
         expected_kl = torch.distributions.kl_divergence(
             torch.distributions.Normal(mu, log_std.exp()),
@@ -45,6 +47,24 @@ class WorldModelTests(unittest.TestCase):
         for name, p in self.model.named_parameters():
             self.assertIsNotNone(p.grad, name)
             self.assertTrue(torch.isfinite(p.grad).all(), name)
+
+    def test_compressor_ce_trains_compressor_and_shared_head_only(self):
+        state = torch.get_rng_state()
+        values = self.model(self.tokens, kl_weight=0.2, mse_weight=0.3, ce_weight=0.4, compressor_ce_weight=0.7)
+        expected = 0.2*values['kl'] + 0.3*values['mse'] + 0.4*values['ce'] + 0.7*values['compressor_ce']
+        torch.testing.assert_close(values['loss'], expected)
+        values['compressor_ce'].backward()
+        for module in [self.model.embedding, self.model.position, self.model.compressor, self.model.head]:
+            for p in module.parameters():
+                self.assertIsNotNone(p.grad)
+                self.assertTrue(torch.isfinite(p.grad).all())
+            self.assertGreater(sum(p.grad.abs().sum().item() for p in module.parameters()), 0.)
+        for module in [self.model.action_encoder, self.model.predictor, self.model.predictor_norm]:
+            for p in module.parameters():
+                self.assertIsNone(p.grad)
+        torch.set_rng_state(state)
+        disabled = self.model(self.tokens, compressor_ce_weight=0.)
+        torch.testing.assert_close(disabled['loss'], disabled['ce'] + disabled['mse'] + 0.001*disabled['kl'])
 
     def test_action_encoder_detaches_inputs_but_trains_its_weights(self):
         memory = self.model.compress(self.tokens)[:, :-1]
