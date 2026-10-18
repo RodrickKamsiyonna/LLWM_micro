@@ -41,15 +41,16 @@ W&B logs total loss, raw compressor CE/MSE/KL, learning rate, gradient norm, val
 
 ## Planning semantics
 
-The prompt is compressed once to the last causal memory. Initialize **500 actions total** from the unit Gaussian prior. Freeze all model weights and optimize only these actions through the entire recursive predictor rollout. Model dropout is disabled. Neither the compressor nor the action encoder runs inside the optimization loop. The action encoder is used only during training. Planning still applies the frozen head to predicted memories to score the goal; this planning objective is separate from the training loss.
+The prompt is compressed once to the last causal memory. For a 500-token horizon, initialize **499 actions** from the unit Gaussian prior. The first next-token prediction comes directly from the prompt memory; each action produces the memory used to predict one subsequent token. Freeze all model weights and optimize only these actions through the entire recursive predictor rollout. Model dropout is disabled. Neither the compressor nor the action encoder runs inside the optimization loop. The action encoder is used only during training. Planning still applies the frozen head to predicted memories to score the goal; this planning objective is separate from the training loss.
 
 The goal string (default `" ."`) is used **only as a cross-entropy target** for the final `len(goal)` positions of the 500-token rollout. No goal character or its embedding is fed into any module. All goal positions are reached using optimized actions and recursively predicted memories. Multi-character goals are scored jointly on that same free rollout, with no teacher forcing.
 
 ```
 memory = compressor(prompt)[-1]  # once, detached
-for t in range(horizon):
+logits[0] = head(memory)  # first token after the prompt
+for t in range(horizon - 1):
     memory = predictor(memory, optimized_actions[t])
-    logits[t] = head(memory)
+    logits[t + 1] = head(memory)
 loss = CE(logits[-len(goal):], goal) + 0.001 * mean(actions**2)
 ```
 
@@ -59,6 +60,8 @@ The action penalty discourages extreme actions outside the training prior; set `
 torchrun --standalone --nproc_per_node=2 train.py \
   --goal 'THE END.' --plan-horizon 500 --plan-iterations 100
 ```
+
+The head maps `m[t]` to `x[t+1]`; therefore applying it to predicted `m[t+1]` predicts `x[t+2]`. The first token cannot be changed by optimizing future actions. A one-token horizon performs no action optimization.
 
 The horizon includes the goal: this example generates 500 tokens total, with the last eight positions optimized toward `THE END.`. Long differentiable rollouts can be expensive and can exploit model errors. A low goal loss does not guarantee coherent intermediate text or a realizable character-level trajectory. Predicted memories need not equal compressor memories for the decoded path. This baseline implements one-step training as requested; multi-step consistency would be a separate experiment. Rank zero plans while other ranks wait, with a four-hour collective timeout. Planning restores training mode, parameter gradient flags, and training RNG streams.
 
@@ -77,4 +80,4 @@ python train.py --device cpu --wandb-mode disabled --steps 2 \
   --eval-batches 1 --plan-horizon 4 --plan-iterations 2
 ```
 
-Local verification used PyTorch 2.2.2, NumPy 1.26.4, and W&B 0.18.7 on an Intel Mac (newer PyTorch wheels are unavailable for that platform). All nine unit tests passed, including compressor CE alignment, weighting, and gradient routing. A two-process CPU/Gloo run completed training, validation, planning, and checkpoint saving. Offline W&B produced both nonempty tables. Resuming step 1 exactly reproduced step 2 model/optimizer/scaler/RNG state, validation loss, and planning JSON. A 500-action CPU planning smoke check completed with decreasing objective. CUDA FP16 and NCCL execution on T4 GPUs remain unverified here; the requirements target PyTorch 2.4+ for the GPU run.
+Local verification used PyTorch 2.2.2, NumPy 1.26.4, and W&B 0.18.7 on an Intel Mac (newer PyTorch wheels are unavailable for that platform). All eleven unit tests passed, including compressor CE alignment, weighting, and gradient routing. A two-process CPU/Gloo run completed training, validation, planning, and checkpoint saving. Offline W&B produced both nonempty tables. Resuming step 1 exactly reproduced step 2 model/optimizer/scaler/RNG state, validation loss, and planning JSON. A 500-action CPU planning smoke check completed with decreasing objective. CUDA FP16 and NCCL execution on T4 GPUs remain unverified here; the requirements target PyTorch 2.4+ for the GPU run.

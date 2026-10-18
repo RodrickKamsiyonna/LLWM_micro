@@ -125,6 +125,38 @@ class WorldModelTests(unittest.TestCase):
         self.assertEqual(result['tokens'].shape, (1, 4))
         self.assertEqual(result['goal_tokens'].shape, (1, 2))
 
+    def test_planning_starts_with_next_token_from_prompt_memory(self):
+        self.model.eval()
+        prompt = self.tokens[:1, :3]
+        initial = self.model.compress(prompt)[:, -1]
+        seen, transitions = [], []
+        head_hook = self.model.head.register_forward_pre_hook(lambda module, args: seen.append(args[0].detach().clone()))
+        original = self.model.transition
+        def transition(memory, action):
+            transitions.append(action)
+            return original(memory, action)
+        self.model.transition = transition
+        try:
+            result = plan(self.model, prompt, torch.tensor([1, 2]), horizon=4, iterations=2)
+        finally:
+            head_hook.remove()
+        # Three objective evaluations plus the final decode, each using H-1 actions.
+        self.assertEqual(len(transitions), 4*3)
+        torch.testing.assert_close(seen[-1][:, 0], initial)
+        torch.testing.assert_close(result['tokens'][:, 0], self.model.head(initial).argmax(-1))
+        self.assertEqual(result['tokens'].size(1), 4)
+
+    def test_one_token_plan_has_no_action_that_can_change_initial_prediction(self):
+        self.model.eval()
+        prompt = self.tokens[:1, :3]
+        expected = self.model.head(self.model.compress(prompt)[:, -1]).argmax(-1)
+        def forbidden(*args):
+            raise AssertionError('one-token plan needs no transition')
+        self.model.transition = forbidden
+        result = plan(self.model, prompt, torch.tensor([1]), horizon=1, iterations=2)
+        torch.testing.assert_close(result['tokens'][:, 0], expected)
+        self.assertEqual(len(result['history']), 1)
+
     def test_terminal_goal_gradients_reach_first_action(self):
         memory = self.model.compress(self.tokens[:1, :3])[:, -1].detach()
         actions = torch.randn(1, 5, 4, requires_grad=True)
