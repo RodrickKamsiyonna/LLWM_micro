@@ -38,6 +38,7 @@ def arguments():
     p.add_argument('--mse-weight', type=float, default=1.)
     p.add_argument('--ce-weight', type=float, default=1.)
     p.add_argument('--eqm-weight', type=float, default=1.)
+    p.add_argument('--disable-eqm', action='store_true', help='skip EQM computation in training and validation; overrides --eqm-weight')
     p.add_argument('--eqm-lambda', type=float, default=1.)
     p.add_argument('--eqm-chunk-size', type=int, default=128)
     p.add_argument('--eval-every', type=int, default=500)
@@ -54,6 +55,8 @@ def arguments():
     p.add_argument('--project', default='llm-world-model')
     p.add_argument('--run-name')
     a = p.parse_args()
+    if a.disable_eqm:
+        a.eqm_weight = 0.
     for name in ['steps', 'batch_size', 'accumulation', 'context', 'eval_every', 'save_every', 'eval_batches', 'plan_horizon', 'plan_iterations', 'eqm_chunk_size']:
         if getattr(a, name) < 1:
             p.error(f'--{name.replace("_", "-")} must be positive')
@@ -119,7 +122,7 @@ def main():
     scaler = (torch.amp.GradScaler('cuda', enabled=cuda) if hasattr(torch.amp, 'GradScaler')
               else torch.cuda.amp.GradScaler(enabled=cuda))
     start, best_val, run_id = 0, float('inf'), None
-    loss_signature = {'objective': 'predictor_ce_eqm_v1', 'ce': args.ce_weight, 'mse': args.mse_weight,
+    loss_signature = {'objective': 'memory_pair_predictor_ce_eqm_v2', 'ce': args.ce_weight, 'mse': args.mse_weight,
                       'kl': args.kl_weight, 'eqm': args.eqm_weight, 'eqm_lambda': args.eqm_lambda}
     if args.resume:
         # Checkpoints include Python/NumPy RNG state: load only trusted local files.

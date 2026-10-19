@@ -30,7 +30,7 @@ class WorldModelTests(unittest.TestCase):
         values = self.model(self.tokens, eqm_chunk_size=3)
         memory = captured['memory']
         torch.set_rng_state(state)
-        mu, log_std = self.model.posterior(memory[:, :-1], self.tokens[:, 1:])
+        mu, log_std = self.model.posterior(memory[:, :-1], memory[:, 1:])
         predicted = self.model.transition(memory[:, :-1], mu + log_std.exp()*torch.randn_like(mu))
         expected_ce = F.cross_entropy(self.model.head(predicted).flatten(0, 1), self.tokens[:, 1:].flatten())
         torch.testing.assert_close(values['ce'], expected_ce)
@@ -80,11 +80,14 @@ class WorldModelTests(unittest.TestCase):
             self.assertGreater(sum(p.grad.abs().sum().item() for p in module.parameters()), 0.)
 
     def test_action_encoder_detaches_inputs_but_trains_its_weights(self):
-        memory = self.model.compress(self.tokens)[:, :-1]
+        memories = self.model.compress(self.tokens)
+        memory, next_memory = memories[:, :-1], memories[:, 1:]
         memory.retain_grad()
-        mu, log_std = self.model.posterior(memory, self.tokens[:, 1:])
+        next_memory.retain_grad()
+        mu, log_std = self.model.posterior(memory, next_memory)
         (mu.square().mean() + log_std.square().mean()).backward()
         self.assertIsNone(memory.grad)
+        self.assertIsNone(next_memory.grad)
         for module in [self.model.embedding, self.model.position, self.model.compressor]:
             for p in module.parameters():
                 self.assertIsNone(p.grad)
@@ -94,8 +97,9 @@ class WorldModelTests(unittest.TestCase):
             self.assertGreater(p.grad.abs().sum().item(), 0.)
 
     def test_memory_gradient_comes_only_from_direct_predictor_input(self):
-        memory = self.model.compress(self.tokens)[:, :-1]
-        mu, log_std = self.model.posterior(memory, self.tokens[:, 1:])
+        memories = self.model.compress(self.tokens)
+        memory = memories[:, :-1]
+        mu, log_std = self.model.posterior(memory, memories[:, 1:])
         action = mu + log_std.exp() * torch.randn_like(mu)
         predicted = self.model.transition(memory, action)
         target = torch.randn_like(predicted)

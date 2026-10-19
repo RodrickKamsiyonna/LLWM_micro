@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 import torch
 from llwm import ModelConfig, WorldModel
 from llwm.eqm import chunk_loss, equilibrium_matching
@@ -77,6 +78,26 @@ class EQMTests(unittest.TestCase):
             self.assertEqual(p.grad is None, gradient is None, name)
             if gradient is not None:
                 torch.testing.assert_close(p.grad, gradient, msg=name)
+
+    def test_disabled_eqm_is_never_called_in_training_or_validation(self):
+        with patch('llwm.model.equilibrium_matching', side_effect=AssertionError('EQM must not run')) as eqm:
+            trained = self.model(self.tokens, eqm_weight=0.)
+            trained['loss'].backward()
+            self.model.eval()
+            with torch.no_grad():
+                evaluated = self.model(self.tokens, eqm_weight=0.)
+            eqm.assert_not_called()
+        for values in [trained, evaluated]:
+            self.assertEqual(values['eqm'].item(), 0.)
+            self.assertFalse(values['eqm'].requires_grad)
+            torch.testing.assert_close(values['loss'], values['ce'] + values['mse'] + 0.001*values['kl'])
+
+    def test_disable_eqm_cli_overrides_weight(self):
+        from train import arguments
+        with patch('sys.argv', ['train.py', '--disable-eqm', '--eqm-weight', '3']):
+            args = arguments()
+        self.assertTrue(args.disable_eqm)
+        self.assertEqual(args.eqm_weight, 0.)
 
 
 if __name__ == '__main__':

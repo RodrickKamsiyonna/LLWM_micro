@@ -5,7 +5,7 @@ Four modules: a causal Transformer compressor, Gaussian action encoder, action-c
 For characters `x[0:T+1]`, the compressor produces `m[0:T+1]`. Each `m[t]` has access only to `x[:t+1]`. Training uses:
 
 ```
-q(a[t] | m[t], x[t+1]) = Normal(mu, exp(log_std))
+q(a[t] | stop_gradient(m[t]), stop_gradient(m[t+1])) = Normal(mu, exp(log_std))
 a[t] = mu + exp(log_std) * epsilon
 predicted_m[t+1] = predictor(m[t], a[t])
 logits[t+1] = head(predicted_m[t+1])
@@ -15,7 +15,7 @@ loss = ce_weight * CE(logits[t+1], x[t+1])
      + eqm_weight * EQM(m[t], stop_gradient(a[t]), x[t+1])
 ```
 
-The action encoder receives detached memory and next-token embeddings. Current memory remains connected directly to the predictor. The head is applied only to predictor outputs. CE/MSE/EQM can update the compressor through memory; EQM detaches sampled actions as in the supplied formula. The next-memory MSE target is detached.
+The action encoder receives detached **current and next compressor memories**, concatenated along their feature dimension. It no longer receives the next-token embedding. Current memory remains connected directly to the predictor. The head is applied only to predictor outputs. CE/MSE/EQM can update the compressor through memory; EQM detaches sampled actions as in the supplied formula. The next-memory MSE target is detached.
 
 Default loss weights: CE=1, MSE=1, KL=0.001, EQM=1. Configure these with `--ce-weight`, `--mse-weight`, `--kl-weight`, and `--eqm-weight`. KL sums action dimensions and averages transitions; CE averages tokens; MSE and EQM average dimensions and transitions. There is no compressor CE loss or `--compressor-ce-weight` setting.
 
@@ -30,7 +30,7 @@ desired = (eps - detach(action)) * eqm_lambda * (1 - gamma)
 eqm = mean((grad_energy - desired)**2)
 ```
 
-`--eqm-lambda` defaults to 1 and controls the target gradient field. `--eqm-weight` defaults to 1 and controls its contribution to total loss. They are different parameters. `--eqm-chunk-size` defaults to 128 transitions; `--eqm-weight 0` skips EQM entirely. The inner CE is summed, preserving the gradient scale of the supplied formula. Ignored targets use index -1.
+`--eqm-lambda` defaults to 1 and controls the target gradient field. `--eqm-weight` defaults to 1 and controls its contribution to total loss. They are different parameters. `--eqm-chunk-size` defaults to 128 transitions. **`--disable-eqm` or `--eqm-weight 0` skips EQM computation entirely in both training and validation**, including its noisy predictor passes and higher-order gradients. The flag overrides any supplied EQM weight. The logged EQM value is zero when disabled. CE, MSE, KL, and planning remain active. The inner CE is summed, preserving the gradient scale of the supplied formula. Ignored targets use index -1.
 
 `llwm/eqm.py` uses exact chunked recomputation. Forward evaluates the loss with a first action derivative and releases each chunk's graph. A custom backward recomputes one chunk at a time with `create_graph=True`, accumulating mixed second derivatives into parameter and memory gradients. The same gamma/noise samples are reused. This avoids retaining a full-batch second-order graph, while preserving all transitions and the original loss/gradients up to floating-point accumulation. No finite differences or subsampling are used.
 
@@ -110,4 +110,4 @@ python train.py --device cpu --wandb-mode disabled --steps 2 \
   --eval-batches 1 --plan-horizon 4 --plan-iterations 2
 ```
 
-Local CPU checks use PyTorch 2.2.2, NumPy 1.26.4, and W&B 0.18.7 on an Intel Mac. All 15 tests passed, including EQM value/every-parameter-gradient equivalence to the full reference, compressor gradient routing, ignored targets, non-divisible chunks, disabled EQM, outer loss scaling, saved-tensor hooks, and planning alignment. A two-process CPU/Gloo run completed training with gradient accumulation, validation EQM, planning, checkpoint saving, and offline W&B logs. CUDA FP16, peak GPU memory, and NCCL behavior remain unverified on this machine; requirements target PyTorch 2.4+ for the GPU run.
+Local CPU checks use PyTorch 2.2.2, NumPy 1.26.4, and W&B 0.18.7 on an Intel Mac. All 17 tests passed, including memory-pair action encoding, detached encoder inputs, EQM value/every-parameter-gradient equivalence to the full reference, proof that disabled EQM is never invoked during training or validation, CLI disabling, outer loss scaling, saved-tensor hooks, and planning alignment. A two-process CPU/Gloo run completed training with gradient accumulation, validation, planning, and checkpoint saving with the memory-pair encoder and EQM disabled. CUDA FP16, peak GPU memory, and NCCL behavior remain unverified on this machine; requirements target PyTorch 2.4+ for the GPU run.

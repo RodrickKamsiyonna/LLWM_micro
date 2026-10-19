@@ -67,9 +67,9 @@ class WorldModel(nn.Module):
             raise ValueError('sequence exceeds compressor context')
         return self.compressor(self.embedding(tokens) + self.position(torch.arange(tokens.size(1), device=tokens.device)))
 
-    def posterior(self, memory, token):
+    def posterior(self, memory, next_memory):
         # Train the encoder without sending its gradients into either input source.
-        inputs = torch.cat((memory.detach(), self.embedding(token).detach()), -1)
+        inputs = torch.cat((memory.detach(), next_memory.detach()), -1)
         mu, log_std = self.action_encoder(inputs).chunk(2, -1)
         return mu, log_std.clamp(-5, 2)
 
@@ -81,12 +81,14 @@ class WorldModel(nn.Module):
     def forward(self, tokens, kl_weight=0.001, mse_weight=1., ce_weight=1., eqm_weight=1., eqm_lambda=1., eqm_chunk_size=128):
         memories = self.compress(tokens)
         current, target = memories[:, :-1], memories[:, 1:].detach()
-        mu, log_std = self.posterior(current, tokens[:, 1:])
+        mu, log_std = self.posterior(current, target)
         action = mu + log_std.exp() * torch.randn_like(mu)
         predicted = self.transition(current, action)
         ce = F.cross_entropy(self.head(predicted).float().flatten(0, 1), tokens[:, 1:].flatten())
         mse = F.mse_loss(predicted.float(), target.float())
         kl = 0.5 * (mu.float().square() + (2*log_std.float()).exp() - 1 - 2*log_std.float()).sum(-1).mean()
-        eqm = equilibrium_matching(self, current, action, tokens[:, 1:], eqm_lambda, eqm_chunk_size) if eqm_weight else ce.new_zeros(())
+        eqm = ce.new_zeros(())
+        if eqm_weight != 0:
+            eqm = equilibrium_matching(self, current, action, tokens[:, 1:], eqm_lambda, eqm_chunk_size)
         return {'loss': ce_weight*ce + mse_weight*mse + kl_weight*kl + eqm_weight*eqm,
                 'ce': ce, 'mse': mse, 'kl': kl, 'eqm': eqm}
