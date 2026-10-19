@@ -84,7 +84,8 @@ class WorldModel(nn.Module):
         mu, log_std = self.posterior(current, target)
         action = mu + log_std.exp() * torch.randn_like(mu)
         predicted = self.transition(current, action)
-        ce = F.cross_entropy(self.head(predicted).float().flatten(0, 1), tokens[:, 1:].flatten())
+        # Token CE trains the readout only; dynamics learn through MSE/KL/EQM.
+        ce = F.cross_entropy(self.head(predicted.detach()).float().flatten(0, 1), tokens[:, 1:].flatten())
         mse = F.mse_loss(predicted.float(), target.float())
         kl = 0.5 * (mu.float().square() + (2*log_std.float()).exp() - 1 - 2*log_std.float()).sum(-1).mean()
         eqm = ce.new_zeros(())

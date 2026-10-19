@@ -122,7 +122,7 @@ def main():
     scaler = (torch.amp.GradScaler('cuda', enabled=cuda) if hasattr(torch.amp, 'GradScaler')
               else torch.cuda.amp.GradScaler(enabled=cuda))
     start, best_val, run_id = 0, float('inf'), None
-    loss_signature = {'objective': 'memory_pair_predictor_ce_eqm_v2', 'ce': args.ce_weight, 'mse': args.mse_weight,
+    loss_signature = {'objective': 'memory_pair_detached_head_ce_eqm_v3', 'ce': args.ce_weight, 'mse': args.mse_weight,
                       'kl': args.kl_weight, 'eqm': args.eqm_weight, 'eqm_lambda': args.eqm_lambda}
     if args.resume:
         # Checkpoints include Python/NumPy RNG state: load only trusted local files.

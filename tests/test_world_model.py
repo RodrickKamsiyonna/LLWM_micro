@@ -46,17 +46,20 @@ class WorldModelTests(unittest.TestCase):
             self.assertIsNotNone(p.grad, name)
             self.assertTrue(torch.isfinite(p.grad).all(), name)
 
-    def test_ce_trains_predictor_and_loss_weights(self):
+    def test_ce_trains_only_head_and_loss_weights(self):
         state = torch.get_rng_state()
         values = self.model(self.tokens, kl_weight=0.2, mse_weight=0.3, ce_weight=0.7, eqm_weight=0.4)
         expected = 0.2*values['kl'] + 0.3*values['mse'] + 0.7*values['ce'] + 0.4*values['eqm']
         torch.testing.assert_close(values['loss'], expected)
         values['ce'].backward()
-        for module in [self.model.embedding, self.model.position, self.model.compressor, self.model.head, self.model.action_encoder, self.model.predictor, self.model.predictor_norm]:
+        for module in [self.model.head]:
             for p in module.parameters():
                 self.assertIsNotNone(p.grad)
                 self.assertTrue(torch.isfinite(p.grad).all())
             self.assertGreater(sum(p.grad.abs().sum().item() for p in module.parameters()), 0.)
+        for module in [self.model.embedding, self.model.position, self.model.compressor, self.model.action_encoder, self.model.predictor, self.model.predictor_norm]:
+            for p in module.parameters():
+                self.assertIsNone(p.grad)
         torch.set_rng_state(state)
         disabled = self.model(self.tokens, eqm_weight=0.)
         torch.testing.assert_close(disabled['loss'], disabled['ce'] + disabled['mse'] + 0.001*disabled['kl'])
@@ -72,7 +75,9 @@ class WorldModelTests(unittest.TestCase):
             head_hook.remove()
         self.assertEqual(set(values), {'loss', 'ce', 'mse', 'kl', 'eqm'})
         self.assertEqual(len(inputs), 1)
-        self.assertIs(inputs[0], memories[0])
+        torch.testing.assert_close(inputs[0], memories[0])
+        self.assertFalse(inputs[0].requires_grad)
+        self.assertIsNone(inputs[0].grad_fn)
         values['mse'].backward()
         for p in self.model.head.parameters():
             self.assertIsNone(p.grad)

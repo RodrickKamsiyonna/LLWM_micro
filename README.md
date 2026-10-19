@@ -8,14 +8,14 @@ For characters `x[0:T+1]`, the compressor produces `m[0:T+1]`. Each `m[t]` has a
 q(a[t] | stop_gradient(m[t]), stop_gradient(m[t+1])) = Normal(mu, exp(log_std))
 a[t] = mu + exp(log_std) * epsilon
 predicted_m[t+1] = predictor(m[t], a[t])
-logits[t+1] = head(predicted_m[t+1])
+logits[t+1] = head(stop_gradient(predicted_m[t+1]))  # training CE only
 loss = ce_weight * CE(logits[t+1], x[t+1])
      + mse_weight * MSE(predicted_m[t+1], stop_gradient(m[t+1]))
      + kl_weight * KL(q(a[t]) || Normal(0, I))
      + eqm_weight * EQM(m[t], stop_gradient(a[t]), x[t+1])
 ```
 
-The action encoder receives detached **current and next compressor memories**, concatenated along their feature dimension. It no longer receives the next-token embedding. Current memory remains connected directly to the predictor. The head is applied only to predictor outputs. CE/MSE/EQM can update the compressor through memory; EQM detaches sampled actions as in the supplied formula. The next-memory MSE target is detached.
+The action encoder receives detached **current and next compressor memories**, concatenated along their feature dimension. Current memory remains connected directly to the predictor. For ordinary training CE, the head receives detached predicted memory: CE updates only the head, without updating the predictor, action encoder, compressor, or shared embeddings. MSE/KL/EQM retain their existing gradient paths, and the next-memory MSE target remains detached. EQM's energy and planning deliberately keep the head-to-memory gradient path connected: EQM needs action derivatives, and planning must optimize actions through predicted memories. Detaching those paths would break these objectives.
 
 Default loss weights: CE=1, MSE=1, KL=0.001, EQM=1. Configure these with `--ce-weight`, `--mse-weight`, `--kl-weight`, and `--eqm-weight`. KL sums action dimensions and averages transitions; CE averages tokens; MSE and EQM average dimensions and transitions. There is no compressor CE loss or `--compressor-ce-weight` setting.
 
