@@ -36,14 +36,16 @@ def arguments():
     p.add_argument('--warmup', type=int, default=200)
     p.add_argument('--kl-weight', type=float, default=0.001)
     p.add_argument('--mse-weight', type=float, default=1.)
-    p.add_argument('--compressor-ce-weight', type=float, default=1.)
+    p.add_argument('--ce-weight', type=float, default=1.)
+    p.add_argument('--eqm-weight', type=float, default=1.)
+    p.add_argument('--eqm-lambda', type=float, default=1.)
+    p.add_argument('--eqm-chunk-size', type=int, default=128)
     p.add_argument('--eval-every', type=int, default=500)
     p.add_argument('--save-every', type=int, default=500)
     p.add_argument('--eval-batches', type=int, default=20)
     p.add_argument('--plan-horizon', type=int, default=500)
     p.add_argument('--plan-iterations', type=int, default=100)
     p.add_argument('--plan-lr', type=float, default=0.05)
-    p.add_argument('--plan-action-weight', type=float, default=0.001)
     p.add_argument('--prompt', default='ROMEO:\n')
     p.add_argument('--goal', default=' .')
     p.add_argument('--seed', type=int, default=1337)
@@ -52,7 +54,7 @@ def arguments():
     p.add_argument('--project', default='llm-world-model')
     p.add_argument('--run-name')
     a = p.parse_args()
-    for name in ['steps', 'batch_size', 'accumulation', 'context', 'eval_every', 'save_every', 'eval_batches', 'plan_horizon', 'plan_iterations']:
+    for name in ['steps', 'batch_size', 'accumulation', 'context', 'eval_every', 'save_every', 'eval_batches', 'plan_horizon', 'plan_iterations', 'eqm_chunk_size']:
         if getattr(a, name) < 1:
             p.error(f'--{name.replace("_", "-")} must be positive')
     if not a.prompt or not a.goal:
@@ -117,6 +119,8 @@ def main():
     scaler = (torch.amp.GradScaler('cuda', enabled=cuda) if hasattr(torch.amp, 'GradScaler')
               else torch.cuda.amp.GradScaler(enabled=cuda))
     start, best_val, run_id = 0, float('inf'), None
+    loss_signature = {'objective': 'predictor_ce_eqm_v1', 'ce': args.ce_weight, 'mse': args.mse_weight,
+                      'kl': args.kl_weight, 'eqm': args.eqm_weight, 'eqm_lambda': args.eqm_lambda}
     if args.resume:
         # Checkpoints include Python/NumPy RNG state: load only trusted local files.
         ckpt = torch.load(args.resume, map_location='cpu', weights_only=False)
@@ -129,6 +133,10 @@ def main():
         optimizer.load_state_dict(ckpt['optimizer'])
         scaler.load_state_dict(ckpt['scaler'])
         start, best_val, run_id = ckpt['step'], ckpt['best_val'], ckpt.get('wandb_id')
+        if ckpt.get('loss_signature') != loss_signature:
+            best_val = float('inf')
+            if rank == 0:
+                print('Training objective changed; resetting best validation loss.', flush=True)
         if len(ckpt['rng']) == world:
             restore_rng(ckpt['rng'][rank])
         elif rank == 0:
@@ -148,18 +156,18 @@ def main():
                              id=run_id, resume='allow' if run_id else None, settings=settings)
         print(f'{sum(p.numel() for p in raw.parameters()):,} parameters; effective batch {args.batch_size*args.accumulation*world}', flush=True)
     def reduced(values):
-        v = torch.stack([values[k].detach().float() for k in ['loss', 'compressor_ce', 'mse', 'kl']])
+        v = torch.stack([values[k].detach().float() for k in ['loss', 'ce', 'mse', 'kl', 'eqm']])
         if world > 1:
             dist.all_reduce(v)
             v /= world
-        return dict(zip(['loss', 'compressor_ce', 'mse', 'kl'], v.tolist()))
+        return dict(zip(['loss', 'ce', 'mse', 'kl', 'eqm'], v.tolist()))
     def evaluate():
         raw.eval()
-        totals = {k: torch.zeros((), device=device) for k in ['loss', 'compressor_ce', 'mse', 'kl']}
+        totals = {k: torch.zeros((), device=device) for k in ['loss', 'ce', 'mse', 'kl', 'eqm']}
         with torch.no_grad():
             for _ in range(args.eval_batches):
                 with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=cuda):
-                    values = raw(batch('val'), args.kl_weight, args.mse_weight, args.compressor_ce_weight)
+                    values = raw(batch('val'), args.kl_weight, args.mse_weight, args.ce_weight, args.eqm_weight, args.eqm_lambda, args.eqm_chunk_size)
                 for k in totals:
                     totals[k] += values[k] / args.eval_batches
         raw.train()
@@ -174,7 +182,8 @@ def main():
             import hashlib
             payload = {'model': raw.state_dict(), 'optimizer': optimizer.state_dict(), 'scaler': scaler.state_dict(),
                        'step': step, 'config': asdict(config), 'args': vars(args), 'chars': chars, 'rng': states,
-                       'best_val': best_val, 'wandb_id': run.id if run else None, 'data_sha256': hashlib.sha256(text.encode()).hexdigest()}
+                       'best_val': best_val, 'loss_signature': loss_signature,
+                       'wandb_id': run.id if run else None, 'data_sha256': hashlib.sha256(text.encode()).hexdigest()}
             target = out / f'step_{step:07d}.pt'
             temporary = out / 'checkpoint.tmp'
             torch.save(payload, temporary)
@@ -194,12 +203,12 @@ def main():
         for group in optimizer.param_groups:
             group['lr'] = lr
         optimizer.zero_grad(set_to_none=True)
-        totals = {k: torch.zeros((), device=device) for k in ['loss', 'compressor_ce', 'mse', 'kl']}
+        totals = {k: torch.zeros((), device=device) for k in ['loss', 'ce', 'mse', 'kl', 'eqm']}
         for micro in range(args.accumulation):
             sync = model.no_sync() if world > 1 and micro < args.accumulation-1 else nullcontext()
             with sync:
                 with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=cuda):
-                    values = model(batch('train'), args.kl_weight, args.mse_weight, args.compressor_ce_weight)
+                    values = model(batch('train'), args.kl_weight, args.mse_weight, args.ce_weight, args.eqm_weight, args.eqm_lambda, args.eqm_chunk_size)
                 if not torch.isfinite(values['loss']):
                     raise RuntimeError(f'nonfinite loss at step {step}')
                 scaler.scale(values['loss']/args.accumulation).backward()
@@ -230,7 +239,7 @@ def main():
             improved = val['loss'] < best_val
             best_val = min(best_val, val['loss'])
             if rank == 0:
-                result = plan(raw, prompt, goal, args.plan_horizon, args.plan_iterations, args.plan_lr, args.plan_action_weight)
+                result = plan(raw, prompt, goal, args.plan_horizon, args.plan_iterations, args.plan_lr)
                 row = {'step': step, 'prompt': args.prompt, 'goal': args.goal, 'rollout': decode(result['tokens'][0]),
                        'predicted_goal': decode(result['goal_tokens'][0]),
                        'initial_loss': result['history'][0]['loss'], 'best_loss': result['best_loss'], 'goal_ce': result['goal_ce'], 'history': result['history']}
