@@ -113,9 +113,11 @@ class WorldModel(nn.Module):
             caches.append(layer_cache)
         return self.compressor_norm(x), KVCache(tuple(caches), position+x.size(1))
 
-    def posterior(self, memory, next_token):
-        # Keep the previously requested stop-gradients at encoder inputs.
-        inputs = torch.cat((memory.detach(), self.embedding(next_token.clamp(min=0)).detach()), -1)
+    def posterior(self, memory, next_memory, *, detach_inputs=True):
+        # Training stops encoder-input gradients; planning differentiates transitions.
+        if detach_inputs:
+            memory, next_memory = memory.detach(), next_memory.detach()
+        inputs = torch.cat((memory, next_memory), -1)
         mean, log_std = self.action_encoder(inputs).chunk(2, -1)
         return mean, log_std.clamp(-5, 2)
 
@@ -142,18 +144,18 @@ class WorldModel(nn.Module):
         if idx.shape != targets.shape:
             raise ValueError('idx and targets must have matching [batch, sequence] shapes')
         h, cache = self.encode(idx)
-        mean, log_std = self.posterior(h, targets)
+        # Contiguous shifted language-model windows: h[t+1] has seen x[t+1].
+        # Encode the final target with the existing cache to supervise every position.
+        with torch.no_grad():
+            last, _ = self.encode(targets[:, -1:].clamp(min=0), kv_cache=cache)
+            next_memory = torch.cat((h[:, 1:].detach(), last), dim=1)
+        mean, log_std = self.posterior(h, next_memory)
         std = log_std.exp()
         action = mean + std*torch.randn_like(mean)
         predicted_memory = self.predict_features(h, action)
         logits = self.decode_memory(predicted_memory)
         valid = targets.ne(-1)
         count = valid.sum().clamp(min=1)
-        # Contiguous shifted language-model windows: h[t+1] has seen x[t+1].
-        # Encode the final target with the existing cache to supervise every position.
-        with torch.no_grad():
-            last, _ = self.encode(targets[:, -1:].clamp(min=0), kv_cache=cache)
-            next_memory = torch.cat((h[:, 1:].detach(), last), dim=1)
         per_token_mse = (predicted_memory.float()-next_memory.float()).square().mean(-1)
         mse = (per_token_mse*valid).sum()/count
         ce = F.cross_entropy(logits.flatten(0, 1), targets.flatten(), ignore_index=-1, reduction='sum') / count

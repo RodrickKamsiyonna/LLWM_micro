@@ -10,8 +10,8 @@ class WorldModelTests(unittest.TestCase):
         torch.set_num_threads(1)
         torch.manual_seed(7)
         self.model = WorldModel(ModelConfig(8, context=4, width=16, heads=2, compressor_layers=2, predictor_layers=1, action_dim=4, dropout=0.))
-        self.idx = torch.randint(8, (2, 4))
-        self.targets = torch.randint(8, (2, 4))
+        tokens = torch.randint(8, (2, 5))
+        self.idx, self.targets = tokens[:, :-1], tokens[:, 1:]
 
     def test_compressor_is_causal(self):
         changed = self.idx.clone()
@@ -24,8 +24,11 @@ class WorldModelTests(unittest.TestCase):
         state = torch.get_rng_state()
         values = self.model(self.idx, self.targets, target_kl=1.)
         torch.set_rng_state(state)
-        memory, _ = self.model.encode(self.idx)
-        mean, log_std = self.model.posterior(memory, self.targets)
+        memory, cache = self.model.encode(self.idx)
+        with torch.no_grad():
+            last, _ = self.model.encode(self.targets[:, -1:], kv_cache=cache)
+            next_memory = torch.cat((memory[:, 1:].detach(), last), 1)
+        mean, log_std = self.model.posterior(memory, next_memory)
         action = mean + log_std.exp()*torch.randn_like(mean)
         logits = self.model.predict_logits(memory, action)
         expected_ce = F.cross_entropy(logits.flatten(0, 1), self.targets.flatten())
@@ -41,19 +44,21 @@ class WorldModelTests(unittest.TestCase):
             self.assertTrue(torch.isfinite(p.grad).all(), name)
             self.assertGreater(p.grad.abs().sum().item(), 0., name)
 
-    def test_action_encoder_uses_token_embeddings_and_detaches_inputs(self):
+    def test_action_encoder_uses_memory_pairs_and_detaches_inputs(self):
         memory, _ = self.model.encode(self.idx)
         memory.retain_grad()
+        next_memory = torch.randn_like(memory, requires_grad=True)
         seen = []
         hook = self.model.action_encoder.register_forward_pre_hook(lambda module, args: seen.append(args[0]))
         try:
-            mean, log_std = self.model.posterior(memory, self.targets)
+            mean, log_std = self.model.posterior(memory, next_memory)
         finally:
             hook.remove()
-        torch.testing.assert_close(seen[0], torch.cat((memory.detach(), self.model.embedding(self.targets).detach()), -1))
+        torch.testing.assert_close(seen[0], torch.cat((memory.detach(), next_memory.detach()), -1))
         self.assertFalse(seen[0].requires_grad)
         (mean.square().mean()+log_std.square().mean()).backward()
         self.assertIsNone(memory.grad)
+        self.assertIsNone(next_memory.grad)
         for module in [self.model.embedding, self.model.compressor, self.model.compressor_norm]:
             for p in module.parameters():
                 self.assertIsNone(p.grad)
@@ -136,10 +141,6 @@ class WorldModelTests(unittest.TestCase):
 
     def test_planning_optimizes_actions_only_and_skips_goal_conditioning(self):
         before = {k: v.clone() for k, v in self.model.state_dict().items()}
-        def forbidden(*args):
-            raise AssertionError('planning must not use posterior or see goal tokens')
-        self.model.posterior = forbidden
-        self.model.action_encoder.forward = forbidden
         seen = []
         original = self.model.encode
         def encode(idx=None, **kwargs):
@@ -152,9 +153,9 @@ class WorldModelTests(unittest.TestCase):
         # Only prompt compression, regardless of horizon or optimization iterations.
         self.assertEqual(len(seen), 1)
         torch.testing.assert_close(seen[0][0], self.idx[:1, :3])
-        self.assertTrue(all(idx is None and 'embeddings' in kwargs for idx, kwargs in seen[1:]))
         for item in result['history']:
-            self.assertEqual(item['loss'], item['goal_ce'])
+            self.assertAlmostEqual(item['loss'], item['goal_ce']+item['consistency_penalty'], places=5)
+            self.assertEqual(item['inverse_consistency'], item['consistency_penalty'])
         self.assertEqual(result['tokens'].shape, (1, 5))
         torch.testing.assert_close(result['goal_tokens'], result['tokens'][:, -2:])
         self.assertTrue(self.model.training)
