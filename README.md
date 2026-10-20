@@ -8,18 +8,17 @@ For characters `x[0:T+1]`, the compressor produces `m[0:T+1]`. Each `m[t]` has a
 q(a[t] | stop_gradient(m[t]), stop_gradient(m[t+1])) = Normal(mu, exp(log_std))
 a[t] = mu + exp(log_std) * epsilon
 predicted_m[t+1] = predictor(m[t], a[t])
-logits[t+1] = head(stop_gradient(predicted_m[t+1]))  # training CE only
+logits[t+1] = head(m[t])  # attached compressor memory
 loss = ce_weight * CE(logits[t+1], x[t+1])
      + mse_weight * MSE(predicted_m[t+1], stop_gradient(m[t+1]))
      + kl_weight * KL(q(a[t]) || Normal(0, I))
-     + eqm_weight * EQM(m[t], stop_gradient(a[t]), x[t+1])
 ```
 
-The action encoder receives detached **current and next compressor memories**, concatenated along their feature dimension. Current memory remains connected directly to the predictor. For ordinary training CE, the head receives detached predicted memory: CE updates only the head, without updating the predictor, action encoder, compressor, or shared embeddings. MSE/KL/EQM retain their existing gradient paths, and the next-memory MSE target remains detached. EQM's energy and planning deliberately keep the head-to-memory gradient path connected: EQM needs action derivatives, and planning must optimize actions through predicted memories. Detaching those paths would break these objectives.
+The head receives **attached current compressor memory** and predicts the next character. CE directly trains both the compressor (including token/position embeddings) and the head; it does not update the predictor or action encoder. The action encoder receives detached current and next compressor memories. The predictor still takes attached current memory and the sampled action, and learns next memory through MSE against the detached next-memory target. The action encoder learns through MSE and action KL. Planning keeps gradients through predicted memories to optimize actions.
 
-Default loss weights: CE=1, MSE=1, KL=0.001, EQM=1. Configure these with `--ce-weight`, `--mse-weight`, `--kl-weight`, and `--eqm-weight`. KL sums action dimensions and averages transitions; CE averages tokens; MSE and EQM average dimensions and transitions. There is no compressor CE loss or `--compressor-ce-weight` setting.
+Default loss weights: CE=1, MSE=1, KL=0.001, EQM=0. The active objective is CE + memory MSE + action KL. `--ce-weight` controls compressor next-token CE. EQM is no longer used in this workflow and is skipped entirely by default in both the model API and training CLI. Its implementation is retained unchanged for explicit legacy experiments. No new flag is needed to disable it; `--disable-eqm` remains available.
 
-## Exact equilibrium matching
+## Legacy equilibrium matching (disabled by default)
 
 ```text
 gamma ~ Uniform(0, 1); eps ~ Normal(0, I)
@@ -30,7 +29,7 @@ desired = (eps - detach(action)) * eqm_lambda * (1 - gamma)
 eqm = mean((grad_energy - desired)**2)
 ```
 
-`--eqm-lambda` defaults to 1 and controls the target gradient field. `--eqm-weight` defaults to 1 and controls its contribution to total loss. They are different parameters. `--eqm-chunk-size` defaults to 128 transitions. **`--disable-eqm` or `--eqm-weight 0` skips EQM computation entirely in both training and validation**, including its noisy predictor passes and higher-order gradients. The flag overrides any supplied EQM weight. The logged EQM value is zero when disabled. CE, MSE, KL, and planning remain active. The inner CE is summed, preserving the gradient scale of the supplied formula. Ignored targets use index -1.
+`--eqm-weight` now defaults to 0: nothing in this section is computed in the active workflow. The unchanged legacy implementation can be explicitly enabled with a positive weight. `--eqm-lambda` defaults to 1 and controls the target gradient field, while the weight controls the contribution to total loss. `--eqm-chunk-size` defaults to 128 transitions. `--disable-eqm` overrides any supplied weight. Disabled EQM logs zero and does not perform noisy predictor passes or higher-order differentiation.
 
 `llwm/eqm.py` uses exact chunked recomputation. Forward evaluates the loss with a first action derivative and releases each chunk's graph. A custom backward recomputes one chunk at a time with `create_graph=True`, accumulating mixed second derivatives into parameter and memory gradients. The same gamma/noise samples are reused. This avoids retaining a full-batch second-order graph, while preserving all transitions and the original loss/gradients up to floating-point accumulation. No finite differences or subsampling are used.
 
@@ -72,15 +71,16 @@ W&B logs total loss, raw CE/MSE/KL/EQM, learning rate, gradient norm, validation
 
 ## Planning semantics
 
-The prompt is compressed once. A 500-token horizon uses **500 initially Gaussian actions and 500 transitions**. Each predicted memory becomes the next predictor input. The model is frozen and dropout disabled; only actions are optimized. Neither the compressor nor the action encoder runs inside the optimization loop.
+The prompt is compressed once. A 500-token horizon uses **499 initially Gaussian actions and transitions**. The first next-token prediction comes from the prompt's last memory; each transition supplies the memory used to predict the subsequent token. Predicted memory becomes the next predictor input. The model is frozen and dropout disabled; only actions are optimized. Neither the compressor nor the action encoder runs inside the optimization loop.
 
 The goal string (default `" ."`) is used **only as a cross-entropy target** for the final `len(goal)` positions of the 500-token rollout. No goal character or its embedding is fed into any module. All goal positions are reached using optimized actions and recursively predicted memories. Multi-character goals are scored jointly on that same free rollout, with no teacher forcing.
 
 ```
 memory = compressor(prompt)[-1]  # once, detached
-for t in range(horizon):
+logits[0] = head(memory)
+for t in range(horizon - 1):
     memory = predictor(memory, optimized_actions[t])
-    logits[t] = head(memory)
+    logits[t + 1] = head(memory)
 loss = CE(logits[-len(goal):], goal)
 ```
 
@@ -91,7 +91,7 @@ torchrun --standalone --nproc_per_node=2 train.py \
   --goal 'THE END.' --plan-horizon 500 --plan-iterations 100
 ```
 
-The decoding path is `head(predictor(m[t], a[t])) -> x[t+1]`, matching predictor CE training. A one-token horizon optimizes one action. Goal text is never a model input.
+The head is now trained as `head(m[t]) -> x[t+1]`; applying it to predicted `m[t+1]` predicts `x[t+2]`. Planning includes the prompt memory first to avoid skipping its next token. A one-token horizon uses no actions, so its prediction cannot be changed by optimizing future actions. Goal text is never a model input.
 
 The horizon includes the goal: this example generates 500 tokens total, with the last eight positions optimized toward `THE END.`. Long differentiable rollouts can be expensive and can exploit model errors. A low goal loss does not guarantee coherent intermediate text or a realizable character-level trajectory. Predicted memories need not equal compressor memories for the decoded path. This baseline implements one-step training as requested; multi-step consistency would be a separate experiment. Rank zero plans while other ranks wait, with a four-hour collective timeout. Planning restores training mode, parameter gradient flags, and training RNG streams.
 
@@ -110,4 +110,4 @@ python train.py --device cpu --wandb-mode disabled --steps 2 \
   --eval-batches 1 --plan-horizon 4 --plan-iterations 2
 ```
 
-Local CPU checks use PyTorch 2.2.2, NumPy 1.26.4, and W&B 0.18.7 on an Intel Mac. All 17 tests passed, including memory-pair action encoding, detached encoder inputs, EQM value/every-parameter-gradient equivalence to the full reference, proof that disabled EQM is never invoked during training or validation, CLI disabling, outer loss scaling, saved-tensor hooks, and planning alignment. A two-process CPU/Gloo run completed training with gradient accumulation, validation, planning, and checkpoint saving with the memory-pair encoder and EQM disabled. CUDA FP16, peak GPU memory, and NCCL behavior remain unverified on this machine; requirements target PyTorch 2.4+ for the GPU run.
+Local CPU checks use PyTorch 2.2.2, NumPy 1.26.4, and W&B 0.18.7 on an Intel Mac. All 18 tests passed, including attached compressor CE gradients, memory-pair action encoding, detached encoder inputs, default EQM disabling, unchanged legacy EQM equivalence, and planning alignment. A two-process CPU/Gloo run completed training with gradient accumulation, validation, planning, and checkpoint saving using compressor CE and EQM disabled by default. CUDA FP16, peak GPU memory, and NCCL behavior remain unverified on this machine; requirements target PyTorch 2.4+ for the GPU run.

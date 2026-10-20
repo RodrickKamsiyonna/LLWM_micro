@@ -32,7 +32,7 @@ class WorldModelTests(unittest.TestCase):
         torch.set_rng_state(state)
         mu, log_std = self.model.posterior(memory[:, :-1], memory[:, 1:])
         predicted = self.model.transition(memory[:, :-1], mu + log_std.exp()*torch.randn_like(mu))
-        expected_ce = F.cross_entropy(self.model.head(predicted).flatten(0, 1), self.tokens[:, 1:].flatten())
+        expected_ce = F.cross_entropy(self.model.head(memory[:, :-1]).flatten(0, 1), self.tokens[:, 1:].flatten())
         torch.testing.assert_close(values['ce'], expected_ce)
         torch.testing.assert_close(values['mse'], F.mse_loss(predicted, memory[:, 1:].detach()))
         expected_kl = torch.distributions.kl_divergence(
@@ -46,27 +46,27 @@ class WorldModelTests(unittest.TestCase):
             self.assertIsNotNone(p.grad, name)
             self.assertTrue(torch.isfinite(p.grad).all(), name)
 
-    def test_ce_trains_only_head_and_loss_weights(self):
+    def test_ce_trains_compressor_and_head_only_and_loss_weights(self):
         state = torch.get_rng_state()
         values = self.model(self.tokens, kl_weight=0.2, mse_weight=0.3, ce_weight=0.7, eqm_weight=0.4)
         expected = 0.2*values['kl'] + 0.3*values['mse'] + 0.7*values['ce'] + 0.4*values['eqm']
         torch.testing.assert_close(values['loss'], expected)
         values['ce'].backward()
-        for module in [self.model.head]:
+        for module in [self.model.head, self.model.embedding, self.model.position, self.model.compressor]:
             for p in module.parameters():
                 self.assertIsNotNone(p.grad)
                 self.assertTrue(torch.isfinite(p.grad).all())
             self.assertGreater(sum(p.grad.abs().sum().item() for p in module.parameters()), 0.)
-        for module in [self.model.embedding, self.model.position, self.model.compressor, self.model.action_encoder, self.model.predictor, self.model.predictor_norm]:
+        for module in [self.model.action_encoder, self.model.predictor, self.model.predictor_norm]:
             for p in module.parameters():
                 self.assertIsNone(p.grad)
         torch.set_rng_state(state)
         disabled = self.model(self.tokens, eqm_weight=0.)
         torch.testing.assert_close(disabled['loss'], disabled['ce'] + disabled['mse'] + 0.001*disabled['kl'])
 
-    def test_training_head_is_applied_only_to_predicted_memory(self):
+    def test_training_head_is_applied_to_attached_compressor_memory(self):
         memories, inputs = [], []
-        compressor_hook = self.model.predictor_norm.register_forward_hook(lambda module, args, output: memories.append(output))
+        compressor_hook = self.model.compressor.register_forward_hook(lambda module, args, output: memories.append(output))
         head_hook = self.model.head.register_forward_pre_hook(lambda module, args: inputs.append(args[0]))
         try:
             values = self.model(self.tokens, eqm_weight=0.)
@@ -75,9 +75,9 @@ class WorldModelTests(unittest.TestCase):
             head_hook.remove()
         self.assertEqual(set(values), {'loss', 'ce', 'mse', 'kl', 'eqm'})
         self.assertEqual(len(inputs), 1)
-        torch.testing.assert_close(inputs[0], memories[0])
-        self.assertFalse(inputs[0].requires_grad)
-        self.assertIsNone(inputs[0].grad_fn)
+        torch.testing.assert_close(inputs[0], memories[0][:, :-1])
+        self.assertTrue(inputs[0].requires_grad)
+        self.assertIsNotNone(inputs[0].grad_fn)
         values['mse'].backward()
         for p in self.model.head.parameters():
             self.assertIsNone(p.grad)
@@ -131,7 +131,7 @@ class WorldModelTests(unittest.TestCase):
         self.assertEqual(result['tokens'].shape, (1, 4))
         self.assertEqual(result['goal_tokens'].shape, (1, 2))
 
-    def test_planning_decodes_after_each_transition(self):
+    def test_planning_decodes_prompt_memory_before_transitions(self):
         self.model.eval()
         prompt = self.tokens[:1, :3]
         initial = self.model.compress(prompt)[:, -1]
@@ -148,17 +148,19 @@ class WorldModelTests(unittest.TestCase):
             result = plan(self.model, prompt, torch.tensor([1, 2]), horizon=4, iterations=2)
         finally:
             head_hook.remove()
-        # Three objective evaluations plus final decode, each using H actions.
-        self.assertEqual(len(transitions), 4*4)
-        torch.testing.assert_close(seen[-1], torch.stack(outputs[-4:], dim=1))
+        # Three objective evaluations plus final decode, each using H-1 actions.
+        self.assertEqual(len(transitions), 4*3)
+        torch.testing.assert_close(seen[-1][:, 0], initial)
+        torch.testing.assert_close(seen[-1][:, 1:], torch.stack(outputs[-3:], dim=1))
         self.assertEqual(result['tokens'].size(1), 4)
 
-    def test_one_token_plan_can_optimize_its_action(self):
+    def test_one_token_plan_uses_only_prompt_memory(self):
         self.model.eval()
         prompt = self.tokens[:1, :3]
         result = plan(self.model, prompt, torch.tensor([1]), horizon=1, iterations=2)
-        self.assertLess(result['best_loss'], result['history'][0]['loss'])
-        self.assertEqual(len(result['history']), 3)
+        expected = self.model.head(self.model.compress(prompt)[:, -1]).argmax(-1)
+        torch.testing.assert_close(result['tokens'][:, 0], expected)
+        self.assertEqual(len(result['history']), 1)
         for h in result['history']:
             self.assertEqual(h['loss'], h['goal_ce'])
             self.assertNotIn('action_l2', h)

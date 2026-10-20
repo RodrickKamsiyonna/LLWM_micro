@@ -78,14 +78,14 @@ class WorldModel(nn.Module):
             memory = block(memory, action)
         return self.predictor_norm(memory)
 
-    def forward(self, tokens, kl_weight=0.001, mse_weight=1., ce_weight=1., eqm_weight=1., eqm_lambda=1., eqm_chunk_size=128):
+    def forward(self, tokens, kl_weight=0.001, mse_weight=1., ce_weight=1., eqm_weight=0., eqm_lambda=1., eqm_chunk_size=128):
         memories = self.compress(tokens)
         current, target = memories[:, :-1], memories[:, 1:].detach()
         mu, log_std = self.posterior(current, target)
         action = mu + log_std.exp() * torch.randn_like(mu)
         predicted = self.transition(current, action)
-        # Token CE trains the readout only; dynamics learn through MSE/KL/EQM.
-        ce = F.cross_entropy(self.head(predicted.detach()).float().flatten(0, 1), tokens[:, 1:].flatten())
+        # Ordinary next-token LM: CE trains the compressor and readout directly.
+        ce = F.cross_entropy(self.head(current).float().flatten(0, 1), tokens[:, 1:].flatten())
         mse = F.mse_loss(predicted.float(), target.float())
         kl = 0.5 * (mu.float().square() + (2*log_std.float()).exp() - 1 - 2*log_std.float()).sum(-1).mean()
         eqm = ce.new_zeros(())
