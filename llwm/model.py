@@ -125,23 +125,37 @@ class WorldModel(nn.Module):
         return self.predictor_norm(memory)
 
     def predict_logits(self, memory, action):
-        logits = self.head(self.predict_features(memory, action)).float()
+        return self.decode_memory(self.predict_features(memory, action))
+
+    def decode_memory(self, memory):
+        """Decode the token added by a predicted memory transition."""
+        logits = self.head(memory).float()
         return 15 * torch.tanh(logits/15)
 
-    def forward(self, idx, targets, *, target_kl, kl_lambda=1., ce_weight=1.):
+    def forward(self, idx, targets, *, target_kl, kl_lambda=1., ce_weight=1., mse_weight=1.):
         if not math.isfinite(target_kl) or target_kl < 0:
             raise ValueError('target_kl must be finite and nonnegative')
         if not math.isfinite(kl_lambda) or kl_lambda < 0:
             raise ValueError('kl_lambda must be finite and nonnegative')
+        if not math.isfinite(mse_weight) or mse_weight < 0:
+            raise ValueError('mse_weight must be finite and nonnegative')
         if idx.shape != targets.shape:
             raise ValueError('idx and targets must have matching [batch, sequence] shapes')
-        h, _ = self.encode(idx)
+        h, cache = self.encode(idx)
         mean, log_std = self.posterior(h, targets)
         std = log_std.exp()
         action = mean + std*torch.randn_like(mean)
-        logits = self.predict_logits(h, action)
+        predicted_memory = self.predict_features(h, action)
+        logits = self.decode_memory(predicted_memory)
         valid = targets.ne(-1)
         count = valid.sum().clamp(min=1)
+        # Contiguous shifted language-model windows: h[t+1] has seen x[t+1].
+        # Encode the final target with the existing cache to supervise every position.
+        with torch.no_grad():
+            last, _ = self.encode(targets[:, -1:].clamp(min=0), kv_cache=cache)
+            next_memory = torch.cat((h[:, 1:].detach(), last), dim=1)
+        per_token_mse = (predicted_memory.float()-next_memory.float()).square().mean(-1)
+        mse = (per_token_mse*valid).sum()/count
         ce = F.cross_entropy(logits.flatten(0, 1), targets.flatten(), ignore_index=-1, reduction='sum') / count
         # Mean over valid tokens AND action dimensions, matching the supplied VAE KL.
         per_dim_kl = 0.5*(mean.float().square() + (2*log_std.float()).exp() - 1 - 2*log_std.float())
@@ -150,5 +164,5 @@ class WorldModel(nn.Module):
         kl_total = kl*self.config.action_dim
         kl_excess = F.relu(kl_total-target_kl)
         kl_penalty = kl_lambda*kl_excess.square()
-        return {'loss': ce_weight*ce + kl_penalty, 'ce': ce, 'kl': kl,
+        return {'loss': ce_weight*ce + kl_penalty + mse_weight*mse, 'ce': ce, 'mse': mse, 'kl': kl,
                 'kl_total': kl_total, 'kl_excess': kl_excess, 'kl_penalty': kl_penalty}

@@ -16,7 +16,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from llwm import ModelConfig, WorldModel
 from llwm.planning import plan
 
-LOSS_KEYS = ('loss', 'ce', 'kl', 'kl_total', 'kl_excess', 'kl_penalty')
+LOSS_KEYS = ('loss', 'ce', 'kl', 'kl_total', 'kl_excess', 'kl_penalty', 'mse')
 
 
 def arguments():
@@ -40,13 +40,13 @@ def arguments():
     p.add_argument('--kl-lambda', type=float, default=1., help='coefficient of squared KL excess above the target')
     p.add_argument('--kl-steps', type=int, default=0, help='linear coefficient warmup in optimizer updates; 0 disables, 1 reaches full strength immediately')
     p.add_argument('--ce-weight', type=float, default=1.)
+    p.add_argument('--mse-weight', type=float, default=1., help='next-memory MSE coefficient')
     p.add_argument('--eval-every', type=int, default=500)
     p.add_argument('--save-every', type=int, default=500)
     p.add_argument('--eval-batches', type=int, default=20)
     p.add_argument('--plan-horizon', type=int, default=500)
     p.add_argument('--plan-iterations', type=int, default=100)
     p.add_argument('--plan-lr', type=float, default=0.05)
-    p.add_argument('--plan-temperature', type=float, default=1.)
     p.add_argument('--prompt', default='ROMEO:\n')
     p.add_argument('--goal', default=' .')
     p.add_argument('--seed', type=int, default=1337)
@@ -64,8 +64,8 @@ def arguments():
         p.error('--kl-lambda must be finite and nonnegative')
     if a.kl_steps < 0:
         p.error('--kl-steps must be nonnegative')
-    if a.plan_temperature <= 0:
-        p.error('--plan-temperature must be positive')
+    if not math.isfinite(a.mse_weight) or a.mse_weight < 0:
+        p.error('--mse-weight must be finite and nonnegative')
     if not a.prompt or not a.goal:
         p.error('prompt and goal must be nonempty')
     return a
@@ -97,7 +97,7 @@ def restore_rng(state):
 
 def main():
     args = arguments()
-    loss_options = dict(target_kl=args.target_kl, kl_lambda=args.kl_lambda, ce_weight=args.ce_weight)
+    loss_options = dict(target_kl=args.target_kl, kl_lambda=args.kl_lambda, ce_weight=args.ce_weight, mse_weight=args.mse_weight)
     world = int(os.environ.get('WORLD_SIZE', 1))
     rank = int(os.environ.get('RANK', 0))
     local = int(os.environ.get('LOCAL_RANK', 0))
@@ -141,7 +141,7 @@ def main():
     scaler = (torch.amp.GradScaler('cuda', enabled=cuda) if hasattr(torch.amp, 'GradScaler')
               else torch.cuda.amp.GradScaler(enabled=cuda))
     start, best_val, run_id = 0, float('inf'), None
-    loss_signature = {'objective': 'token_action_kl_budget_v2', 'ce': args.ce_weight,
+    loss_signature = {'objective': 'token_action_memory_kl_budget_v3', 'ce': args.ce_weight, 'mse': args.mse_weight,
                       'target_kl': args.target_kl, 'kl_lambda': args.kl_lambda, 'kl_steps': args.kl_steps}
     if args.resume:
         # Checkpoints include Python/NumPy RNG state: load only trusted local files.
@@ -265,7 +265,7 @@ def main():
             improved = val['loss'] < best_val
             best_val = min(best_val, val['loss'])
             if rank == 0:
-                result = plan(raw, prompt, goal, args.plan_horizon, args.plan_iterations, args.plan_lr, args.plan_temperature)
+                result = plan(raw, prompt, goal, args.plan_horizon, args.plan_iterations, args.plan_lr)
                 row = {'step': step, 'prompt': args.prompt, 'goal': args.goal, 'rollout': decode(result['tokens'][0]),
                        'predicted_goal': decode(result['goal_tokens'][0]),
                        'initial_loss': result['history'][0]['loss'], 'best_loss': result['best_loss'], 'goal_ce': result['goal_ce'], 'history': result['history']}

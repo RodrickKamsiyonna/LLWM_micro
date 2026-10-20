@@ -1,6 +1,6 @@
 # Character-level latent-action language model
 
-The compressor encodes text into causal memories. A Gaussian action encoder sees the current memory and **next-token embedding**. An action-conditioned predictor and vocabulary head reconstruct that next token. Predictor features are not next-memory targets: there is no memory MSE loss.
+The compressor encodes text into causal memories. A Gaussian action encoder sees the current memory and **next-token embedding**. An action-conditioned predictor and vocabulary head reconstruct that next token. The predictor output also predicts the next compressor memory, supervised by a detached next-memory MSE target.
 
 ## Training
 
@@ -8,15 +8,15 @@ The compressor encodes text into causal memories. A Gaussian action encoder sees
 h = compressor(input_tokens)
 mu, log_std = action_encoder(detach(h), detach(embedding(next_tokens)))
 action = mu + exp(log_std) * Normal(0, I)
-features = predictor(h, action)       # adaptive LayerNorm conditioning
+features = predictor(h, action)       # predicted next memory; adaptive LayerNorm conditioning
 logits = 15 * tanh(head(features) / 15)
 kl = mean_valid_tokens_and_dimensions(KL(q(action) || Normal(0, I)))
 kl_total = kl * action_dim
 excess = relu(kl_total - target_kl)
-loss = ce_weight * CE(logits, next_tokens) + kl_lambda * excess**2
+loss = ce_weight * CE(logits, next_tokens) + kl_lambda * excess**2 + mse_weight * MSE(features, detach(next_memory))
 ```
 
-CE trains the compressor, action encoder, predictor, and head. The previously requested stop-gradients remain at both action-encoder inputs; CE reaches the compressor through the direct predictor input. The head and predictor output are **not detached**. There is no separate compressor-head CE and no predictor-memory MSE.
+CE trains the compressor, action encoder, predictor, and head. The previously requested stop-gradients remain at both action-encoder inputs; CE reaches the compressor through the direct predictor input. The head and predictor output are **not detached**. There is no separate compressor-head CE. MSE trains the predictor, action encoder, and current-memory compressor path; its next-memory target is detached. `--mse-weight` defaults to 1 and must be finite and nonnegative. W&B logs the unweighted MSE as `train/mse` and `val/mse`.
 
 ## KL budget
 
@@ -26,7 +26,7 @@ The required `--target-kl` sets the budget; there is deliberately no default tar
 
 ```python
 excess = F.relu(kl_total - target_kl)
-loss = ce_weight * ce + kl_lambda * excess.square()
+loss = ce_weight * ce + kl_lambda * excess.square() + mse_weight * mse
 ```
 
 This is a one-sided upper-budget penalty: below or at the target it is zero, so it does not push KL up toward the target. Above it, the penalty grows quadratically. Setting `--kl-lambda 0` disables the penalty while retaining raw KL diagnostics. Target and coefficient must be finite and nonnegative.
@@ -45,7 +45,7 @@ W&B logs the effective coefficient as `train/kl_lambda`. Training `kl_penalty` u
 
 The budget applies to the mean valid-token KL of each forward microbatch. DDP and gradient accumulation average those microbatch objectives. Since the penalty is nonlinear, the average of local penalties need not equal a penalty recomputed from the globally averaged logged KL. This implementation follows the formula on each forward call.
 
-CE and KL ignore target index `-1`; an entirely ignored batch returns finite zero losses. Ignored targets do not consume the KL budget. Next-token embeddings clamp ignored indices to zero before lookup. Training uses FP16 autocast/gradient scaling on CUDA and FP32 on CPU. CE computation and its gradient paths are unchanged.
+CE, KL, and MSE ignore target index `-1`; an entirely ignored batch returns finite zero losses. Ignored targets do not consume the KL budget. Next-token embeddings clamp ignored indices to zero before lookup. Training uses FP16 autocast/gradient scaling on CUDA and FP32 on CPU. CE computation and its gradient paths are unchanged.
 
 ## Run on two T4 GPUs
 
@@ -61,9 +61,9 @@ torchrun --standalone --nproc_per_node=2 train.py \
   --steps 20000 --context 256 --batch-size 16 --accumulation 4 \
   --width 256 --heads 4 --compressor-layers 4 --predictor-layers 3 \
   --action-dim 32 --lr 3e-4 --warmup 200 \
-  --ce-weight 1 --target-kl 5.0 --kl-lambda 1 --kl-steps 1000 \
+  --ce-weight 1 --mse-weight 1 --target-kl 5.0 --kl-lambda 1 --kl-steps 1000 \
   --plan-horizon 500 --plan-iterations 100 --plan-lr 0.05 \
-  --plan-temperature 1 --goal ' .' --run-name token-action
+  --goal ' .' --run-name token-action
 ```
 
 The target 5.0 and 1,000-update ramp above are examples: choose your own `--target-kl` and `--kl-steps`. Other defaults are shown above. Compressor/predictor feed-forward dimension is `4*width`; the action encoder has two linear layers, hidden dimension `2*width`, and outputs action mean/log standard deviation. Dropout defaults to 0.1. Width must be divisible by the head count, with an even per-head dimension for rotary positions. The model uses rotary positions and a sliding causal attention window of `--context` tokens. Positions can extend past the training context during planning.
@@ -72,37 +72,34 @@ Each GPU samples independent random windows. Two GPUs with batch size 16 and fou
 
 The dataset is [Karpathy's Tiny Shakespeare](https://github.com/karpathy/char-rnn/tree/master/data/tinyshakespeare), split contiguously into 90% training and 10% validation. `prepare.py` explicitly downloads it; `--data` can point to another UTF-8 text file.
 
-## Planning with soft embeddings and a differentiable KV cache
+## Planning in memory space
 
 Compress the prompt once, then optimize one initially Gaussian action per generated token:
 
 ```text
-h, prefix_cache = compressor(prompt)  # computed once, without gradients
-cache = prefix_cache
+h = compressor(prompt)[-1]  # once, without gradients
 for t in range(horizon):
-    logits[t] = head(predictor(h, actions[t]))  # same capped logits as training
-    if t + 1 < horizon:
-        probabilities = softmax(logits[t] / temperature)
-        soft_embedding = probabilities @ token_embedding_table
-        h, cache = compressor(soft_embedding, cache)
+    h = predictor(h, actions[t])
+    memories[t] = h
+logits = capped_head(memories)
 planning_loss = CE(logits[-len(goal):], goal)
 ```
 
-A soft embedding is the probability-weighted expected token embedding, not a raw-logit-weighted vector or a random sample. `--plan-temperature` controls the softmax temperature and defaults to 1. Every subsequent memory comes from re-encoding the previous soft token through the compressor. **Predictor features are never fed back as memory.** A 500-token plan has 500 actions/predictions and 499 soft-feedback compressor updates after the prompt.
+Each predicted memory is the input to the next transition. The same LLM head used during training decodes the token added by each transition. A 500-token plan has 500 actions and 500 memory transitions; the last predicted memory decodes the 500th token. There are no soft-token embeddings, compressor feedback calls, or KV-cache updates during rollout. The prompt is truncated to its final context-length tokens.
 
-The prompt is truncated to the final context-length tokens. Its prefix cache is reused across optimization iterations. Generated-token K/V caches remain differentiable: detaching them would cut goal gradients to earlier actions. Cache updates are out of place, so the original prefix cache is never mutated. Each layer retains at most `context-1` previous K/V positions; adding the next token forms a context-length attention window. Single-query decoding attends to all retained past keys, rather than using an incorrectly aligned causal mask. Rotary positions continue increasing as the window slides.
+Goal characters are targets only: they are never fed into the predictor or action encoder. The goal can be multiple characters or lines and must fit in the horizon and vocabulary. The only planning objective is goal-suffix CE, with no action regularizer or MSE. All model parameters are frozen and restored afterward; gradients traverse the complete memory trajectory to optimize only the actions.
 
-Caching saves repeated prefix computation. It does not make planning's backward graph constant-memory: generated states/caches must remain connected across the horizon. Attention uses PyTorch scaled-dot-product attention. All model parameters are frozen during planning and restored afterward; only actions are optimized. No action encoder, goal embeddings, action regularizer, or memory MSE is used in planning. Goal characters are CE targets only. There is no final unnecessary soft-feedback update after the last prediction.
+Planning uses Adam for 100 iterations at learning rate 0.05 by default. The initialized candidate and final update are included when selecting the best goal loss. After optimization, the best memory trajectory is decoded with the LLM head using argmax. Exact match checks that decoded suffix; the goal is never appended to the output. Low goal loss does not guarantee an exact match or coherent intermediate text. Long memory rollouts can accumulate prediction error; one-step MSE does not guarantee long-horizon accuracy. The obsolete `--plan-temperature` option has been removed because no soft-token feedback is used.
 
-Planning uses Adam for 100 iterations at learning rate 0.05 by default. The initialized candidate and final update are included when selecting the best goal loss. Logged text is the argmax decoding of the **soft-feedback trajectory**; feeding those hard argmax tokens back could produce a different trajectory. A low soft planning loss does not guarantee successful discrete generation or coherent intermediate text. Exact match checks the actual decoded soft-rollout suffix, not appended target text.
+Training expects contiguous shifted windows (`idx=x[:-1]`, `targets=x[1:]`). Next-memory targets reuse the shifted compressor output and encode the final target once with the training prefix cache, covering all positions without a second full compressor pass. Targets are detached, while the current-memory path stays differentiable. KV caching remains available for compressor encoding but is unnecessary during memory-space planning.
 
 ## Logging, checkpoints, and compatibility
 
-W&B is online by default (`wandb login`). `--wandb-mode offline` saves locally; `disabled` turns logging off. Rank zero logs `loss`, `ce`, per-dimension `kl`, `kl_total`, `kl_excess`, and weighted `kl_penalty` under both `train/` and `val/`, plus learning rate, gradient norm, and planning text/history. The weighted penalty is exactly `kl_lambda * kl_excess**2`, the KL contribution added to total loss. `--project` and `--run-name` customize the run. No obsolete MSE metric is logged.
+W&B is online by default (`wandb login`). `--wandb-mode offline` saves locally; `disabled` turns logging off. Rank zero logs `loss`, `ce`, per-dimension `kl`, `kl_total`, `kl_excess`, weighted `kl_penalty`, and next-memory `mse` under both `train/` and `val/`, plus learning rate, gradient norm, and planning text/history. The weighted penalty is exactly `kl_lambda * kl_excess**2`, the KL contribution added to total loss. `--project` and `--run-name` customize the run.
 
 The new default output directory is `checkpoints/token_action`, preserving older experiment artifacts. Numbered checkpoints retain model/optimizer/scaler, configuration, vocabulary, dataset hash, step, best validation loss, W&B ID, and per-rank Python/NumPy/Torch/CUDA RNG state. `latest.pt` and `best.pt` point to relevant files. Planning results are also written as `plan_STEP.json`.
 
-**Old memory-MSE/learned-position checkpoints are incompatible; start a fresh run.** Resume new checkpoints with matching arguments and `--resume checkpoints/token_action/latest.pt`. Keep world size and total steps unchanged for RNG and learning-rate continuity. Only load trusted checkpoint files. Changing the objective, target, or penalty strength resets the stored best validation loss for comparison. Existing token-action architecture checkpoints remain loadable; the new CLI requires an explicit target.
+**Old memory-MSE/learned-position checkpoints are incompatible; start a fresh run.** Resume new checkpoints with matching arguments and `--resume checkpoints/token_action/latest.pt`. Keep world size and total steps unchanged for RNG and learning-rate continuity. Only load trusted checkpoint files. Changing the objective, target, MSE weight, schedule, or penalty strength resets the stored best validation loss for comparison. Existing token-action architecture checkpoints remain loadable; the new CLI requires an explicit target.
 
 ## Verification
 
@@ -110,8 +107,8 @@ The new default output directory is `checkpoints/token_action`, preserving older
 python -m unittest discover -s tests -v
 ```
 
-Tests cover next-token CE and per-dimension KL, analytical KL totals and budget gradients, below/at/above-budget behavior, ignored targets, required CLI target validation, all-module CE gradients, detached action-encoder inputs, full-versus-cached sliding attention, cache immutability, and soft-rollout/action-gradient equivalence to full recomputation. CPU mixed-precision gradients are checked as well.
+Tests cover next-token CE and per-dimension KL, analytical KL totals and budget gradients, coefficient ramp endpoints, ignored targets, all-module CE gradients, detached action-encoder inputs, full-versus-cached sliding attention, next-memory target alignment and stop-gradients, and autoregressive memory-rollout/action gradients. Planning tests assert that the compressor is called exactly once and goal tokens never enter the model. CPU mixed-precision gradients are checked as well.
 
-All 23 tests passed. A two-process CPU/Gloo run completed training, validation, cached planning, and checkpoint saving. Offline W&B recorded the budget losses and a KL coefficient ramp of 0, 0.5, and 1, while validation used the full coefficient throughout. Resuming from the first checkpoint exactly reproduced the uninterrupted model, optimizer, scaler, RNG state, validation result, and planning outputs.
+All 24 tests passed for the memory-space implementation. A two-process CPU/Gloo smoke run also completed training with CE, KL warmup and MSE, validation, memory-space planning, and checkpoint saving. Actual T4 execution remains unverified locally.
 
 Local verification uses PyTorch 2.2.2/NumPy 1.26.4/W&B 0.18.7 on an Intel Mac. The GPU requirements target PyTorch 2.4+. Actual T4 FP16/NCCL performance and peak GPU memory remain unverified locally.

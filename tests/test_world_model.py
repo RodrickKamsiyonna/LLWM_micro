@@ -34,7 +34,7 @@ class WorldModelTests(unittest.TestCase):
             torch.distributions.Normal(torch.zeros_like(mean), torch.ones_like(mean))).mean()
         torch.testing.assert_close(values['ce'], expected_ce)
         torch.testing.assert_close(values['kl'], expected_kl)
-        self.assertEqual(set(values), {'loss', 'ce', 'kl', 'kl_total', 'kl_excess', 'kl_penalty'})
+        self.assertEqual(set(values), {'loss', 'ce', 'kl', 'kl_total', 'kl_excess', 'kl_penalty', 'mse'})
         values['ce'].backward()
         for name, p in self.model.named_parameters():
             self.assertIsNotNone(p.grad, name)
@@ -64,7 +64,7 @@ class WorldModelTests(unittest.TestCase):
         targets = self.targets.clone()
         targets[:, -1] = -1
         values = self.model(self.idx, targets, ce_weight=0.3, target_kl=0., kl_lambda=0.2)
-        torch.testing.assert_close(values['loss'], 0.3*values['ce']+0.2*values['kl_total'].square())
+        torch.testing.assert_close(values['loss'], 0.3*values['ce']+0.2*values['kl_total'].square()+values['mse'])
         ignored = self.model(self.idx, torch.full_like(targets, -1), target_kl=1.)
         self.assertEqual(ignored['loss'].item(), 0.)
         ignored['loss'].backward()
@@ -98,37 +98,41 @@ class WorldModelTests(unittest.TestCase):
         torch.testing.assert_close(actual[:, -1], expected[:, -1])
         self.assertEqual(cache.layers[0][0].size(2), 0)
 
-    def test_soft_cached_rollout_matches_full_recomputation_and_gradients(self):
+    def test_memory_rollout_matches_transitions_and_keeps_early_action_gradients(self):
         self.model.eval()
-        for p in self.model.parameters():
-            p.requires_grad_(False)
-        prompt = self.idx[:1, :3]
-        with torch.no_grad():
-            memories, cache = self.model.encode(prompt)
-            initial = memories[:, -1]
-            prefix = self.model.embedding(prompt)
-        saved = [(k.clone(), v.clone()) for k, v in cache.layers]
+        initial = self.model.encode(self.idx[:1])[0][:, -1].detach()
         actions = torch.randn(1, 6, 4, requires_grad=True)
-        cached = rollout(self.model, initial, cache, actions, temperature=0.8)
-        cached_grad, = torch.autograd.grad(F.cross_entropy(cached[:, -1], torch.tensor([2])), actions)
-        reference_actions = actions.detach().clone().requires_grad_()
-        memory, sequence, predictions = initial, prefix, []
-        for i, action in enumerate(reference_actions.unbind(1)):
-            logits = self.model.predict_logits(memory, action)
-            predictions.append(logits)
-            if i+1 < reference_actions.size(1):
-                soft = (logits/0.8).softmax(-1) @ self.model.embedding.weight
-                sequence = torch.cat((sequence, soft[:, None]), 1)
-                states, _ = self.model.encode(embeddings=sequence)
-                memory = states[:, -1]
-        reference = torch.stack(predictions, 1)
-        reference_grad, = torch.autograd.grad(F.cross_entropy(reference[:, -1], torch.tensor([2])), reference_actions)
-        torch.testing.assert_close(cached, reference, atol=2e-6, rtol=2e-5)
-        torch.testing.assert_close(cached_grad, reference_grad, atol=2e-6, rtol=2e-4)
-        self.assertGreater(cached_grad[:, 0].abs().sum().item(), 1e-10)
-        for (k, v), (old_k, old_v) in zip(cache.layers, saved):
-            torch.testing.assert_close(k, old_k)
-            torch.testing.assert_close(v, old_v)
+        actual = rollout(self.model, initial, actions)
+        memory, predictions = initial, []
+        for action in actions.unbind(1):
+            memory = self.model.predict_features(memory, action)
+            predictions.append(self.model.decode_memory(memory))
+        torch.testing.assert_close(actual, torch.stack(predictions, 1))
+        gradient, = torch.autograd.grad(F.cross_entropy(actual[:, -1], torch.tensor([2])), actions)
+        self.assertGreater(gradient[:, 0].abs().sum().item(), 1e-10)
+        self.assertTrue(torch.isfinite(gradient).all())
+
+    def test_mse_targets_are_shifted_detached_compressor_memories(self):
+        tokens = torch.randint(8, (2, 5))
+        idx, targets = tokens[:, :-1], tokens[:, 1:]
+        predicted = []
+        original = self.model.predict_features
+        def predict(memory, action):
+            result = original(memory, action)
+            predicted.append(result)
+            return result
+        self.model.predict_features = predict
+        values = self.model(idx, targets, target_kl=1., mse_weight=0.7)
+        with torch.no_grad():
+            expected, _ = self.model.encode(tokens)
+        torch.testing.assert_close(values['mse'], F.mse_loss(predicted[0], expected[:, 1:]))
+        gradient, = torch.autograd.grad(values['mse'], predicted[0], retain_graph=True)
+        torch.testing.assert_close(gradient, 2*(predicted[0]-expected[:, 1:])/predicted[0].numel())
+        torch.testing.assert_close(values['loss'], values['ce']+values['kl_penalty']+0.7*values['mse'])
+        values['mse'].backward()
+        for module in [self.model.compressor, self.model.predictor, self.model.action_encoder]:
+            self.assertTrue(any(p.grad is not None and p.grad.abs().sum()>0 for p in module.parameters()))
+        self.assertIsNone(self.model.head.weight.grad)
 
     def test_planning_optimizes_actions_only_and_skips_goal_conditioning(self):
         before = {k: v.clone() for k, v in self.model.state_dict().items()}
@@ -145,8 +149,8 @@ class WorldModelTests(unittest.TestCase):
         self.model.embedding.weight.requires_grad_(False)
         result = plan(self.model, self.idx[:1, :3], torch.tensor([1, 2]), horizon=5, iterations=5)
         self.assertLess(result['best_loss'], result['history'][0]['loss'])
-        # One prompt prefill; six candidates plus final decode, four feedback steps each.
-        self.assertEqual(len(seen), 1 + 7*4)
+        # Only prompt compression, regardless of horizon or optimization iterations.
+        self.assertEqual(len(seen), 1)
         torch.testing.assert_close(seen[0][0], self.idx[:1, :3])
         self.assertTrue(all(idx is None and 'embeddings' in kwargs for idx, kwargs in seen[1:]))
         for item in result['history']:
@@ -171,7 +175,7 @@ class WorldModelTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.model.encode(self.idx, embeddings=self.model.embedding(self.idx))
         with self.assertRaises(ValueError):
-            plan(self.model, self.idx, torch.tensor([1]), temperature=0)
+            plan(self.model, self.idx, torch.tensor([1]), horizon=0)
 
     def test_autocast_preserves_attention_dtypes_and_budget_gradients(self):
         with torch.autocast(device_type='cpu', dtype=torch.bfloat16):

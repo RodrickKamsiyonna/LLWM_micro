@@ -20,7 +20,7 @@ class KLBudgetTests(unittest.TestCase):
         expanded = mean.expand(2, 4, 4)
         with patch.object(self.model, 'posterior', return_value=(expanded, torch.zeros_like(expanded))):
             values = self.model(self.idx, self.targets if targets is None else targets,
-                                target_kl=target, kl_lambda=strength, ce_weight=0.7)
+                                target_kl=target, kl_lambda=strength, ce_weight=0.7, mse_weight=0.)
         return values, mean
 
     def test_total_is_dimension_sum_not_batch_sum(self):
