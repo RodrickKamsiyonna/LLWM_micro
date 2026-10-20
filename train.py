@@ -16,7 +16,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from llwm import ModelConfig, WorldModel
 from llwm.planning import plan
 
-LOSS_KEYS = ('loss', 'ce', 'kl', 'eqm')
+LOSS_KEYS = ('loss', 'ce', 'kl', 'kl_total', 'kl_excess', 'kl_penalty')
 
 
 def arguments():
@@ -36,12 +36,10 @@ def arguments():
     p.add_argument('--dropout', type=float, default=0.1)
     p.add_argument('--lr', type=float, default=3e-4)
     p.add_argument('--warmup', type=int, default=200)
-    p.add_argument('--kl-weight', type=float, default=0.001)
+    p.add_argument('--target-kl', type=float, required=True, help='total KL budget in nats per valid token (sum over action dimensions)')
+    p.add_argument('--kl-lambda', type=float, default=1., help='coefficient of squared KL excess above the target')
+    p.add_argument('--kl-steps', type=int, default=0, help='linear coefficient warmup in optimizer updates; 0 disables, 1 reaches full strength immediately')
     p.add_argument('--ce-weight', type=float, default=1.)
-    p.add_argument('--eqm-weight', type=float, default=0., help='optional equilibrium matching; zero skips computation')
-    p.add_argument('--disable-eqm', action='store_true', help='skip EQM computation in training and validation; overrides --eqm-weight')
-    p.add_argument('--eqm-lambda', type=float, default=1.)
-    p.add_argument('--eqm-chunk-size', type=int, default=128)
     p.add_argument('--eval-every', type=int, default=500)
     p.add_argument('--save-every', type=int, default=500)
     p.add_argument('--eval-batches', type=int, default=20)
@@ -57,16 +55,31 @@ def arguments():
     p.add_argument('--project', default='llm-world-model')
     p.add_argument('--run-name')
     a = p.parse_args()
-    if a.disable_eqm:
-        a.eqm_weight = 0.
-    for name in ['steps', 'batch_size', 'accumulation', 'context', 'eval_every', 'save_every', 'eval_batches', 'plan_horizon', 'plan_iterations', 'eqm_chunk_size']:
+    for name in ['steps', 'batch_size', 'accumulation', 'context', 'eval_every', 'save_every', 'eval_batches', 'plan_horizon', 'plan_iterations']:
         if getattr(a, name) < 1:
             p.error(f'--{name.replace("_", "-")} must be positive')
+    if not math.isfinite(a.target_kl) or a.target_kl < 0:
+        p.error('--target-kl must be finite and nonnegative')
+    if not math.isfinite(a.kl_lambda) or a.kl_lambda < 0:
+        p.error('--kl-lambda must be finite and nonnegative')
+    if a.kl_steps < 0:
+        p.error('--kl-steps must be nonnegative')
     if a.plan_temperature <= 0:
         p.error('--plan-temperature must be positive')
     if not a.prompt or not a.goal:
         p.error('prompt and goal must be nonempty')
     return a
+
+
+def kl_lambda_at_step(step, peak, ramp_steps):
+    """For N>=2: update 1 uses zero, update N and later use peak."""
+    if ramp_steps < 0:
+        raise ValueError('KL ramp length must be nonnegative')
+    if ramp_steps == 0:
+        return peak
+    if ramp_steps == 1:
+        return peak if step >= 1 else 0.
+    return peak * min(1., max(0., (step-1)/(ramp_steps-1)))
 
 
 def rng_state():
@@ -84,8 +97,7 @@ def restore_rng(state):
 
 def main():
     args = arguments()
-    loss_options = dict(kl_weight=args.kl_weight, ce_weight=args.ce_weight, eqm_weight=args.eqm_weight,
-                        eqm_lambda=args.eqm_lambda, eqm_chunk_size=args.eqm_chunk_size)
+    loss_options = dict(target_kl=args.target_kl, kl_lambda=args.kl_lambda, ce_weight=args.ce_weight)
     world = int(os.environ.get('WORLD_SIZE', 1))
     rank = int(os.environ.get('RANK', 0))
     local = int(os.environ.get('LOCAL_RANK', 0))
@@ -129,8 +141,8 @@ def main():
     scaler = (torch.amp.GradScaler('cuda', enabled=cuda) if hasattr(torch.amp, 'GradScaler')
               else torch.cuda.amp.GradScaler(enabled=cuda))
     start, best_val, run_id = 0, float('inf'), None
-    loss_signature = {'objective': 'token_action_soft_feedback_v1', 'ce': args.ce_weight,
-                      'kl': args.kl_weight, 'eqm': args.eqm_weight, 'eqm_lambda': args.eqm_lambda}
+    loss_signature = {'objective': 'token_action_kl_budget_v2', 'ce': args.ce_weight,
+                      'target_kl': args.target_kl, 'kl_lambda': args.kl_lambda, 'kl_steps': args.kl_steps}
     if args.resume:
         # Checkpoints include Python/NumPy RNG state: load only trusted local files.
         ckpt = torch.load(args.resume, map_location='cpu', weights_only=False)
@@ -193,6 +205,7 @@ def main():
             payload = {'model': raw.state_dict(), 'optimizer': optimizer.state_dict(), 'scaler': scaler.state_dict(),
                        'step': step, 'config': asdict(config), 'args': vars(args), 'chars': chars, 'rng': states,
                        'best_val': best_val, 'loss_signature': loss_signature,
+                       'kl_lambda_effective': kl_lambda_at_step(step, args.kl_lambda, args.kl_steps),
                        'wandb_id': run.id if run else None, 'data_sha256': hashlib.sha256(text.encode()).hexdigest()}
             target = out / f'step_{step:07d}.pt'
             temporary = out / 'checkpoint.tmp'
@@ -209,6 +222,8 @@ def main():
     step, skipped_updates = start + 1, 0
     while step <= args.steps:
         raw.train()
+        effective_kl_lambda = kl_lambda_at_step(step, args.kl_lambda, args.kl_steps)
+        train_loss_options = dict(loss_options, kl_lambda=effective_kl_lambda)
         lr = args.lr * min(1., step/max(1, args.warmup)) * (0.1 + 0.9*0.5*(1+math.cos(math.pi*max(0, step-args.warmup)/max(1, args.steps-args.warmup))))
         for group in optimizer.param_groups:
             group['lr'] = lr
@@ -218,7 +233,7 @@ def main():
             sync = model.no_sync() if world > 1 and micro < args.accumulation-1 else nullcontext()
             with sync:
                 with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=cuda):
-                    values = model(*batch('train'), **loss_options)
+                    values = model(*batch('train'), **train_loss_options)
                 if not torch.isfinite(values['loss']):
                     raise RuntimeError(f'nonfinite loss at step {step}')
                 scaler.scale(values['loss']/args.accumulation).backward()
@@ -238,7 +253,7 @@ def main():
                 print(f'AMP overflow: retrying optimizer step {step} at scale {scaler.get_scale()}', flush=True)
             continue
         metrics = {f'train/{k}': v for k, v in reduced(totals).items()}
-        metrics.update({'train/lr': lr, 'train/grad_norm': float(grad_norm), 'train/amp_skipped_updates': skipped_updates, 'step': step})
+        metrics.update({'train/lr': lr, 'train/kl_lambda': effective_kl_lambda, 'train/grad_norm': float(grad_norm), 'train/amp_skipped_updates': skipped_updates, 'step': step})
         improved = False
         if step % args.eval_every == 0 or step == args.steps:
             # Evaluation/planning must not change subsequent training RNG streams.
@@ -246,6 +261,7 @@ def main():
             torch.manual_seed(args.seed+10000+rank)
             val = evaluate()
             metrics.update({f'val/{k}': v for k, v in val.items()})
+            metrics['val/kl_lambda'] = args.kl_lambda
             improved = val['loss'] < best_val
             best_val = min(best_val, val['loss'])
             if rank == 0:

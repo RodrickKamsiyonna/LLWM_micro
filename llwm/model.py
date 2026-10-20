@@ -1,8 +1,8 @@
 from dataclasses import dataclass
+import math
 import torch
 from torch import nn
 from torch.nn import functional as F
-from .eqm import equilibrium_matching
 
 
 @dataclass
@@ -128,7 +128,11 @@ class WorldModel(nn.Module):
         logits = self.head(self.predict_features(memory, action)).float()
         return 15 * torch.tanh(logits/15)
 
-    def forward(self, idx, targets, *, kl_weight=0.001, ce_weight=1., eqm_weight=0., eqm_lambda=1., eqm_chunk_size=128):
+    def forward(self, idx, targets, *, target_kl, kl_lambda=1., ce_weight=1.):
+        if not math.isfinite(target_kl) or target_kl < 0:
+            raise ValueError('target_kl must be finite and nonnegative')
+        if not math.isfinite(kl_lambda) or kl_lambda < 0:
+            raise ValueError('kl_lambda must be finite and nonnegative')
         if idx.shape != targets.shape:
             raise ValueError('idx and targets must have matching [batch, sequence] shapes')
         h, _ = self.encode(idx)
@@ -142,7 +146,9 @@ class WorldModel(nn.Module):
         # Mean over valid tokens AND action dimensions, matching the supplied VAE KL.
         per_dim_kl = 0.5*(mean.float().square() + (2*log_std.float()).exp() - 1 - 2*log_std.float())
         kl = (per_dim_kl*valid[..., None]).sum()/(count*self.config.action_dim)
-        eqm = ce.new_zeros(())
-        if eqm_weight != 0:
-            eqm = equilibrium_matching(self, h, action, targets, eqm_lambda, eqm_chunk_size)
-        return {'loss': ce_weight*ce + kl_weight*kl + eqm_weight*eqm, 'ce': ce, 'kl': kl, 'eqm': eqm}
+        # Total latent KL per valid token, averaged across this microbatch.
+        kl_total = kl*self.config.action_dim
+        kl_excess = F.relu(kl_total-target_kl)
+        kl_penalty = kl_lambda*kl_excess.square()
+        return {'loss': ce_weight*ce + kl_penalty, 'ce': ce, 'kl': kl,
+                'kl_total': kl_total, 'kl_excess': kl_excess, 'kl_penalty': kl_penalty}

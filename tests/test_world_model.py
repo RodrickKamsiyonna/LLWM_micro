@@ -1,5 +1,4 @@
 import unittest
-from unittest.mock import patch
 import torch
 from torch.nn import functional as F
 from llwm import ModelConfig, WorldModel
@@ -23,7 +22,7 @@ class WorldModelTests(unittest.TestCase):
 
     def test_ce_kl_alignment_and_all_training_gradients(self):
         state = torch.get_rng_state()
-        values = self.model(self.idx, self.targets)
+        values = self.model(self.idx, self.targets, target_kl=1.)
         torch.set_rng_state(state)
         memory, _ = self.model.encode(self.idx)
         mean, log_std = self.model.posterior(memory, self.targets)
@@ -35,7 +34,7 @@ class WorldModelTests(unittest.TestCase):
             torch.distributions.Normal(torch.zeros_like(mean), torch.ones_like(mean))).mean()
         torch.testing.assert_close(values['ce'], expected_ce)
         torch.testing.assert_close(values['kl'], expected_kl)
-        self.assertEqual(set(values), {'loss', 'ce', 'kl', 'eqm'})
+        self.assertEqual(set(values), {'loss', 'ce', 'kl', 'kl_total', 'kl_excess', 'kl_penalty'})
         values['ce'].backward()
         for name, p in self.model.named_parameters():
             self.assertIsNotNone(p.grad, name)
@@ -64,9 +63,9 @@ class WorldModelTests(unittest.TestCase):
     def test_ignored_targets_and_loss_weights(self):
         targets = self.targets.clone()
         targets[:, -1] = -1
-        values = self.model(self.idx, targets, ce_weight=0.3, kl_weight=0.2, eqm_weight=0.4, eqm_chunk_size=3)
-        torch.testing.assert_close(values['loss'], 0.3*values['ce']+0.2*values['kl']+0.4*values['eqm'])
-        ignored = self.model(self.idx, torch.full_like(targets, -1))
+        values = self.model(self.idx, targets, ce_weight=0.3, target_kl=0., kl_lambda=0.2)
+        torch.testing.assert_close(values['loss'], 0.3*values['ce']+0.2*values['kl_total'].square())
+        ignored = self.model(self.idx, torch.full_like(targets, -1), target_kl=1.)
         self.assertEqual(ignored['loss'].item(), 0.)
         ignored['loss'].backward()
 
@@ -174,9 +173,9 @@ class WorldModelTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             plan(self.model, self.idx, torch.tensor([1]), temperature=0)
 
-    def test_autocast_preserves_attention_dtypes_and_eqm_gradients(self):
+    def test_autocast_preserves_attention_dtypes_and_budget_gradients(self):
         with torch.autocast(device_type='cpu', dtype=torch.bfloat16):
-            values = self.model(self.idx, self.targets, eqm_weight=0.1, eqm_chunk_size=3)
+            values = self.model(self.idx, self.targets, target_kl=0., kl_lambda=0.1)
         values['loss'].backward()
         for name, p in self.model.named_parameters():
             self.assertIsNotNone(p.grad, name)

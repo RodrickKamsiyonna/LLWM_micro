@@ -10,14 +10,42 @@ mu, log_std = action_encoder(detach(h), detach(embedding(next_tokens)))
 action = mu + exp(log_std) * Normal(0, I)
 features = predictor(h, action)       # adaptive LayerNorm conditioning
 logits = 15 * tanh(head(features) / 15)
-loss = ce_weight * CE(logits, next_tokens)
-     + kl_weight * KL(q(action) || Normal(0, I))
-     + eqm_weight * equilibrium_matching(h, detach(action), next_tokens)
+kl = mean_valid_tokens_and_dimensions(KL(q(action) || Normal(0, I)))
+kl_total = kl * action_dim
+excess = relu(kl_total - target_kl)
+loss = ce_weight * CE(logits, next_tokens) + kl_lambda * excess**2
 ```
 
 CE trains the compressor, action encoder, predictor, and head. The previously requested stop-gradients remain at both action-encoder inputs; CE reaches the compressor through the direct predictor input. The head and predictor output are **not detached**. There is no separate compressor-head CE and no predictor-memory MSE.
 
-KL averages over valid tokens **and action dimensions**, matching the supplied VAE formula. This differs from the old implementation, which summed action dimensions. CE and KL ignore target index `-1`; an entirely ignored target batch returns finite zero losses when EQM is disabled. Next-token embeddings clamp ignored indices to zero before lookup. Training uses FP16 autocast/gradient scaling on CUDA and FP32 on CPU.
+## KL budget
+
+`kl` is the mean Gaussian KL over valid tokens and action dimensions. Therefore **`kl_total = kl * action_dim` is the mean total latent KL per valid token**, measured in nats. It is not the sum across the whole minibatch. To get that sum, multiply by the number of valid tokens as well.
+
+The required `--target-kl` sets the budget; there is deliberately no default target. `--kl-lambda` defaults to 1 and weights the squared positive excess:
+
+```python
+excess = F.relu(kl_total - target_kl)
+loss = ce_weight * ce + kl_lambda * excess.square()
+```
+
+This is a one-sided upper-budget penalty: below or at the target it is zero, so it does not push KL up toward the target. Above it, the penalty grows quadratically. Setting `--kl-lambda 0` disables the penalty while retaining raw KL diagnostics. Target and coefficient must be finite and nonnegative.
+
+### KL coefficient warmup
+
+`--kl-steps N` linearly ramps the training coefficient to the configured `--kl-lambda`. For `N >= 2`, optimizer update 1 uses zero, update N reaches the full coefficient, and later updates keep that value:
+
+```python
+effective_kl_lambda = kl_lambda * min(1.0, max(0.0, (step - 1) / (kl_steps - 1)))
+```
+
+`--kl-steps 0` is the default and disables the ramp, preserving immediate full strength. A one-update ramp (`--kl-steps 1`) reaches full strength on its first update. The ramp advances per successful optimizer update, not per microbatch or GPU; FP16 overflow retries reuse the same coefficient. Resuming uses the saved global step, so warmup does not restart. Keep `--kl-steps` and `--kl-lambda` unchanged when resuming the same schedule.
+
+W&B logs the effective coefficient as `train/kl_lambda`. Training `kl_penalty` uses that coefficient. Validation always uses the full configured coefficient and logs `val/kl_lambda`, keeping validation loss comparable throughout warmup. Checkpoints include the ramp configuration and the coefficient used at their saved step.
+
+The budget applies to the mean valid-token KL of each forward microbatch. DDP and gradient accumulation average those microbatch objectives. Since the penalty is nonlinear, the average of local penalties need not equal a penalty recomputed from the globally averaged logged KL. This implementation follows the formula on each forward call.
+
+CE and KL ignore target index `-1`; an entirely ignored batch returns finite zero losses. Ignored targets do not consume the KL budget. Next-token embeddings clamp ignored indices to zero before lookup. Training uses FP16 autocast/gradient scaling on CUDA and FP32 on CPU. CE computation and its gradient paths are unchanged.
 
 ## Run on two T4 GPUs
 
@@ -33,13 +61,12 @@ torchrun --standalone --nproc_per_node=2 train.py \
   --steps 20000 --context 256 --batch-size 16 --accumulation 4 \
   --width 256 --heads 4 --compressor-layers 4 --predictor-layers 3 \
   --action-dim 32 --lr 3e-4 --warmup 200 \
-  --ce-weight 1 --kl-weight 0.001 \
-  --eqm-weight 0 \
+  --ce-weight 1 --target-kl 5.0 --kl-lambda 1 --kl-steps 1000 \
   --plan-horizon 500 --plan-iterations 100 --plan-lr 0.05 \
   --plan-temperature 1 --goal ' .' --run-name token-action
 ```
 
-Defaults are shown above. Compressor/predictor feed-forward dimension is `4*width`; the action encoder has two linear layers, hidden dimension `2*width`, and outputs action mean/log standard deviation. Dropout defaults to 0.1. Width must be divisible by the head count, with an even per-head dimension for rotary positions. The model uses rotary positions and a sliding causal attention window of `--context` tokens. Positions can extend past the training context during planning.
+The target 5.0 and 1,000-update ramp above are examples: choose your own `--target-kl` and `--kl-steps`. Other defaults are shown above. Compressor/predictor feed-forward dimension is `4*width`; the action encoder has two linear layers, hidden dimension `2*width`, and outputs action mean/log standard deviation. Dropout defaults to 0.1. Width must be divisible by the head count, with an even per-head dimension for rotary positions. The model uses rotary positions and a sliding causal attention window of `--context` tokens. Positions can extend past the training context during planning.
 
 Each GPU samples independent random windows. Two GPUs with batch size 16 and four accumulation microsteps give 128 sequences per optimizer update. AdamW uses weight decay 0.01; learning rate warms up over 200 steps, then follows cosine decay to 10% of the peak. `--eval-every` and `--save-every` default to 500 optimizer steps. Validation/planning also run at the final step. Overflow attempts are retried without counting as completed optimizer updates.
 
@@ -69,39 +96,13 @@ Caching saves repeated prefix computation. It does not make planning's backward 
 
 Planning uses Adam for 100 iterations at learning rate 0.05 by default. The initialized candidate and final update are included when selecting the best goal loss. Logged text is the argmax decoding of the **soft-feedback trajectory**; feeding those hard argmax tokens back could produce a different trajectory. A low soft planning loss does not guarantee successful discrete generation or coherent intermediate text. Exact match checks the actual decoded soft-rollout suffix, not appended target text.
 
-## Optional exact equilibrium matching
-
-EQM is retained with the memory-efficient implementation and is disabled by default. Enable it with a positive weight, for example `--eqm-weight 0.1 --eqm-lambda 1 --eqm-chunk-size 128`. `--disable-eqm` forces weight zero even if another weight is supplied. Zero weight skips computation entirely in training and validation and logs EQM as zero.
-
-```text
-gamma ~ Uniform(0, 1); eps ~ Normal(0, I)
-a_gamma = gamma * detach(action) + (1 - gamma) * eps
-energy = sum_token_CE(predict_logits(h, a_gamma), next_tokens)
-grad_energy = d energy / d a_gamma
-desired = (eps - detach(action)) * eqm_lambda * (1 - gamma)
-eqm = mean((grad_energy - desired)**2)
-```
-
-`eqm_lambda` sets the desired gradient field; `eqm_weight` sets this loss's contribution. The EQM energy uses the same smooth-capped logits as CE and planning. Its inner CE is **summed**, preserving the supplied action-gradient scale. Sampled actions are detached in EQM, while memory remains connected to the compressor.
-
-`llwm/eqm.py` processes independent predictor transitions in chunks. Forward computes the EQM value with first action derivatives and frees each chunk's graph. Custom backward recomputes each chunk with `create_graph=True`, accumulating exact parameter and memory gradients. Gamma/noise samples are reused. There is no finite-difference approximation or subsampling. Second derivatives are still required mathematically; recomputation trades extra work for lower saved activation memory. Smaller chunks generally save more memory and can be slower. This relies on the predictor/head operating independently across tokens.
-
-EQM runs in FP32 with autocast disabled. AMP scales only the outer gradients. Validation computes local action derivatives even inside its surrounding `no_grad` context. The comparison benchmark measures isolated EQM, not full training:
-
-```bash
-python benchmark_eqm.py --device cuda --tokens 4096 --width 256 \
-  --action-dim 32 --layers 3 --chunk-size 128
-```
-
-CPU saved-storage measurements are a proxy, not RSS or CUDA allocator peaks. Measure actual T4 memory/throughput before selecting a chunk size.
-
 ## Logging, checkpoints, and compatibility
 
-W&B is online by default (`wandb login`). `--wandb-mode offline` saves locally; `disabled` turns logging off. Rank zero logs total loss and individual CE/KL/EQM in training and validation, learning rate, gradient norm, and planning text/history. `--project` and `--run-name` customize the run. No obsolete MSE metric is logged.
+W&B is online by default (`wandb login`). `--wandb-mode offline` saves locally; `disabled` turns logging off. Rank zero logs `loss`, `ce`, per-dimension `kl`, `kl_total`, `kl_excess`, and weighted `kl_penalty` under both `train/` and `val/`, plus learning rate, gradient norm, and planning text/history. The weighted penalty is exactly `kl_lambda * kl_excess**2`, the KL contribution added to total loss. `--project` and `--run-name` customize the run. No obsolete MSE metric is logged.
 
 The new default output directory is `checkpoints/token_action`, preserving older experiment artifacts. Numbered checkpoints retain model/optimizer/scaler, configuration, vocabulary, dataset hash, step, best validation loss, W&B ID, and per-rank Python/NumPy/Torch/CUDA RNG state. `latest.pt` and `best.pt` point to relevant files. Planning results are also written as `plan_STEP.json`.
 
-**Old memory-MSE/learned-position checkpoints are incompatible; start a fresh run.** Resume new checkpoints with matching arguments and `--resume checkpoints/token_action/latest.pt`. Keep world size and total steps unchanged for RNG and learning-rate continuity. Only load trusted checkpoint files. Changing loss weights resets the stored best validation loss for comparison.
+**Old memory-MSE/learned-position checkpoints are incompatible; start a fresh run.** Resume new checkpoints with matching arguments and `--resume checkpoints/token_action/latest.pt`. Keep world size and total steps unchanged for RNG and learning-rate continuity. Only load trusted checkpoint files. Changing the objective, target, or penalty strength resets the stored best validation loss for comparison. Existing token-action architecture checkpoints remain loadable; the new CLI requires an explicit target.
 
 ## Verification
 
@@ -109,8 +110,8 @@ The new default output directory is `checkpoints/token_action`, preserving older
 python -m unittest discover -s tests -v
 ```
 
-Tests cover next-token CE and per-dimension KL, all-module CE gradients, detached action-encoder inputs, ignored targets, full-versus-cached attention beyond the context window, cached multi-token appends, context length one, immutable prefix caches, and cached soft-rollout/action-gradient equivalence to full recomputation. EQM tests compare values and all parameter gradients with the full reference and check disabled execution, loss scaling, and saved-tensor hooks.
+Tests cover next-token CE and per-dimension KL, analytical KL totals and budget gradients, below/at/above-budget behavior, ignored targets, required CLI target validation, all-module CE gradients, detached action-encoder inputs, full-versus-cached sliding attention, cache immutability, and soft-rollout/action-gradient equivalence to full recomputation. CPU mixed-precision gradients are checked as well.
 
-All 18 tests passed, including CPU mixed precision with EQM and differentiable cache equivalence. A two-process CPU/Gloo run completed training with optional EQM, gradient accumulation, validation, cached planning, checkpointing, and offline W&B logging of CE/KL/EQM. A small CPU configuration completed a 500-step soft rollout with decreasing goal loss. Resuming a checkpoint exactly reproduced model/optimizer/scaler/RNG state, validation loss, and planning JSON.
+All 23 tests passed. A two-process CPU/Gloo run completed training, validation, cached planning, and checkpoint saving. Offline W&B recorded the budget losses and a KL coefficient ramp of 0, 0.5, and 1, while validation used the full coefficient throughout. Resuming from the first checkpoint exactly reproduced the uninterrupted model, optimizer, scaler, RNG state, validation result, and planning outputs.
 
 Local verification uses PyTorch 2.2.2/NumPy 1.26.4/W&B 0.18.7 on an Intel Mac. The GPU requirements target PyTorch 2.4+. Actual T4 FP16/NCCL performance and peak GPU memory remain unverified locally.
