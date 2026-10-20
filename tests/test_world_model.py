@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 import torch
 from torch.nn import functional as F
 from llwm import ModelConfig, WorldModel
@@ -9,187 +10,177 @@ class WorldModelTests(unittest.TestCase):
     def setUp(self):
         torch.set_num_threads(1)
         torch.manual_seed(7)
-        self.model = WorldModel(ModelConfig(8, context=8, width=16, heads=2, compressor_layers=1, predictor_layers=1, action_dim=4, dropout=0.))
-        self.tokens = torch.randint(8, (2, 7))
+        self.model = WorldModel(ModelConfig(8, context=4, width=16, heads=2, compressor_layers=2, predictor_layers=1, action_dim=4, dropout=0.))
+        self.idx = torch.randint(8, (2, 4))
+        self.targets = torch.randint(8, (2, 4))
 
     def test_compressor_is_causal(self):
-        changed = self.tokens.clone()
-        changed[:, 4:] = (changed[:, 4:]+1) % 8
-        torch.testing.assert_close(self.model.compress(changed)[:, :4], self.model.compress(self.tokens)[:, :4])
+        changed = self.idx.clone()
+        changed[:, 2:] = (changed[:, 2:]+1) % 8
+        actual, _ = self.model.encode(changed)
+        expected, _ = self.model.encode(self.idx)
+        torch.testing.assert_close(actual[:, :2], expected[:, :2])
 
-    def test_losses_align_and_target_is_detached(self):
-        captured = {}
-        original = self.model.compress
-        def compress(tokens):
-            result = original(tokens)
-            result.retain_grad()
-            captured['memory'] = result
-            return result
-        self.model.compress = compress
+    def test_ce_kl_alignment_and_all_training_gradients(self):
         state = torch.get_rng_state()
-        values = self.model(self.tokens, eqm_chunk_size=3)
-        memory = captured['memory']
+        values = self.model(self.idx, self.targets)
         torch.set_rng_state(state)
-        mu, log_std = self.model.posterior(memory[:, :-1], memory[:, 1:])
-        predicted = self.model.transition(memory[:, :-1], mu + log_std.exp()*torch.randn_like(mu))
-        expected_ce = F.cross_entropy(self.model.head(memory[:, :-1]).flatten(0, 1), self.tokens[:, 1:].flatten())
-        torch.testing.assert_close(values['ce'], expected_ce)
-        torch.testing.assert_close(values['mse'], F.mse_loss(predicted, memory[:, 1:].detach()))
+        memory, _ = self.model.encode(self.idx)
+        mean, log_std = self.model.posterior(memory, self.targets)
+        action = mean + log_std.exp()*torch.randn_like(mean)
+        logits = self.model.predict_logits(memory, action)
+        expected_ce = F.cross_entropy(logits.flatten(0, 1), self.targets.flatten())
         expected_kl = torch.distributions.kl_divergence(
-            torch.distributions.Normal(mu, log_std.exp()),
-            torch.distributions.Normal(torch.zeros_like(mu), torch.ones_like(mu))).sum(-1).mean()
+            torch.distributions.Normal(mean, log_std.exp()),
+            torch.distributions.Normal(torch.zeros_like(mean), torch.ones_like(mean))).mean()
+        torch.testing.assert_close(values['ce'], expected_ce)
         torch.testing.assert_close(values['kl'], expected_kl)
-        values['loss'].backward()
-        self.assertEqual(memory.grad[:, -1].abs().sum().item(), 0.)
-        self.assertGreater(memory.grad[:, :-1].abs().sum().item(), 0.)
+        self.assertEqual(set(values), {'loss', 'ce', 'kl', 'eqm'})
+        values['ce'].backward()
         for name, p in self.model.named_parameters():
             self.assertIsNotNone(p.grad, name)
             self.assertTrue(torch.isfinite(p.grad).all(), name)
+            self.assertGreater(p.grad.abs().sum().item(), 0., name)
 
-    def test_ce_trains_compressor_and_head_only_and_loss_weights(self):
-        state = torch.get_rng_state()
-        values = self.model(self.tokens, kl_weight=0.2, mse_weight=0.3, ce_weight=0.7, eqm_weight=0.4)
-        expected = 0.2*values['kl'] + 0.3*values['mse'] + 0.7*values['ce'] + 0.4*values['eqm']
-        torch.testing.assert_close(values['loss'], expected)
-        values['ce'].backward()
-        for module in [self.model.head, self.model.embedding, self.model.position, self.model.compressor]:
-            for p in module.parameters():
-                self.assertIsNotNone(p.grad)
-                self.assertTrue(torch.isfinite(p.grad).all())
-            self.assertGreater(sum(p.grad.abs().sum().item() for p in module.parameters()), 0.)
-        for module in [self.model.action_encoder, self.model.predictor, self.model.predictor_norm]:
-            for p in module.parameters():
-                self.assertIsNone(p.grad)
-        torch.set_rng_state(state)
-        disabled = self.model(self.tokens, eqm_weight=0.)
-        torch.testing.assert_close(disabled['loss'], disabled['ce'] + disabled['mse'] + 0.001*disabled['kl'])
-
-    def test_training_head_is_applied_to_attached_compressor_memory(self):
-        memories, inputs = [], []
-        compressor_hook = self.model.compressor.register_forward_hook(lambda module, args, output: memories.append(output))
-        head_hook = self.model.head.register_forward_pre_hook(lambda module, args: inputs.append(args[0]))
-        try:
-            values = self.model(self.tokens, eqm_weight=0.)
-        finally:
-            compressor_hook.remove()
-            head_hook.remove()
-        self.assertEqual(set(values), {'loss', 'ce', 'mse', 'kl', 'eqm'})
-        self.assertEqual(len(inputs), 1)
-        torch.testing.assert_close(inputs[0], memories[0][:, :-1])
-        self.assertTrue(inputs[0].requires_grad)
-        self.assertIsNotNone(inputs[0].grad_fn)
-        values['mse'].backward()
-        for p in self.model.head.parameters():
-            self.assertIsNone(p.grad)
-        for module in [self.model.predictor, self.model.action_encoder]:
-            self.assertGreater(sum(p.grad.abs().sum().item() for p in module.parameters()), 0.)
-
-    def test_action_encoder_detaches_inputs_but_trains_its_weights(self):
-        memories = self.model.compress(self.tokens)
-        memory, next_memory = memories[:, :-1], memories[:, 1:]
+    def test_action_encoder_uses_token_embeddings_and_detaches_inputs(self):
+        memory, _ = self.model.encode(self.idx)
         memory.retain_grad()
-        next_memory.retain_grad()
-        mu, log_std = self.model.posterior(memory, next_memory)
-        (mu.square().mean() + log_std.square().mean()).backward()
+        seen = []
+        hook = self.model.action_encoder.register_forward_pre_hook(lambda module, args: seen.append(args[0]))
+        try:
+            mean, log_std = self.model.posterior(memory, self.targets)
+        finally:
+            hook.remove()
+        torch.testing.assert_close(seen[0], torch.cat((memory.detach(), self.model.embedding(self.targets).detach()), -1))
+        self.assertFalse(seen[0].requires_grad)
+        (mean.square().mean()+log_std.square().mean()).backward()
         self.assertIsNone(memory.grad)
-        self.assertIsNone(next_memory.grad)
-        for module in [self.model.embedding, self.model.position, self.model.compressor]:
+        for module in [self.model.embedding, self.model.compressor, self.model.compressor_norm]:
             for p in module.parameters():
                 self.assertIsNone(p.grad)
         for p in self.model.action_encoder.parameters():
             self.assertIsNotNone(p.grad)
-            self.assertTrue(torch.isfinite(p.grad).all())
-            self.assertGreater(p.grad.abs().sum().item(), 0.)
 
-    def test_memory_gradient_comes_only_from_direct_predictor_input(self):
-        memories = self.model.compress(self.tokens)
-        memory = memories[:, :-1]
-        mu, log_std = self.model.posterior(memory, memories[:, 1:])
-        action = mu + log_std.exp() * torch.randn_like(mu)
-        predicted = self.model.transition(memory, action)
-        target = torch.randn_like(predicted)
-        loss = F.mse_loss(predicted, target)
-        actual, = torch.autograd.grad(loss, memory)
-        direct_memory = memory.detach().requires_grad_()
-        direct_predicted = self.model.transition(direct_memory, action.detach())
-        direct_loss = F.mse_loss(direct_predicted, target)
-        expected, = torch.autograd.grad(direct_loss, direct_memory)
-        torch.testing.assert_close(actual, expected)
-        self.assertGreater(actual.abs().sum().item(), 0.)
+    def test_ignored_targets_and_loss_weights(self):
+        targets = self.targets.clone()
+        targets[:, -1] = -1
+        values = self.model(self.idx, targets, ce_weight=0.3, kl_weight=0.2, eqm_weight=0.4, eqm_chunk_size=3)
+        torch.testing.assert_close(values['loss'], 0.3*values['ce']+0.2*values['kl']+0.4*values['eqm'])
+        ignored = self.model(self.idx, torch.full_like(targets, -1))
+        self.assertEqual(ignored['loss'].item(), 0.)
+        ignored['loss'].backward()
 
-    def test_planning_changes_actions_not_weights_and_restores_flags(self):
+    def test_cached_encoder_matches_full_sliding_attention_past_context(self):
+        self.model.eval()
+        tokens = torch.randint(8, (1, 11))
+        expected, _ = self.model.encode(tokens)
+        actual, cache = self.model.encode(tokens[:, :3])
+        pieces = [actual]
+        for i in range(3, tokens.size(1)):
+            actual, cache = self.model.encode(tokens[:, i:i+1], kv_cache=cache)
+            pieces.append(actual)
+            for k, v in cache.layers:
+                self.assertLessEqual(k.size(2), self.model.config.context-1)
+                self.assertEqual(k.shape, v.shape)
+        torch.testing.assert_close(torch.cat(pieces, 1), expected, atol=2e-6, rtol=2e-5)
+        self.assertEqual(cache.position, 11)
+
+    def test_cached_chunk_matches_full_attention_and_context_one(self):
+        self.model.eval()
+        tokens = torch.randint(8, (1, 10))
+        expected, _ = self.model.encode(tokens)
+        prefix, cache = self.model.encode(tokens[:, :3])
+        suffix, cache = self.model.encode(tokens[:, 3:], kv_cache=cache)
+        torch.testing.assert_close(torch.cat((prefix, suffix), 1), expected, atol=2e-6, rtol=2e-5)
+        one = WorldModel(ModelConfig(8, context=1, width=16, heads=2, compressor_layers=1, predictor_layers=1, action_dim=4, dropout=0.)).eval()
+        _, cache = one.encode(tokens[:, :1])
+        actual, cache = one.encode(tokens[:, 1:2], kv_cache=cache)
+        expected, _ = one.encode(tokens[:, :2])
+        torch.testing.assert_close(actual[:, -1], expected[:, -1])
+        self.assertEqual(cache.layers[0][0].size(2), 0)
+
+    def test_soft_cached_rollout_matches_full_recomputation_and_gradients(self):
+        self.model.eval()
+        for p in self.model.parameters():
+            p.requires_grad_(False)
+        prompt = self.idx[:1, :3]
+        with torch.no_grad():
+            memories, cache = self.model.encode(prompt)
+            initial = memories[:, -1]
+            prefix = self.model.embedding(prompt)
+        saved = [(k.clone(), v.clone()) for k, v in cache.layers]
+        actions = torch.randn(1, 6, 4, requires_grad=True)
+        cached = rollout(self.model, initial, cache, actions, temperature=0.8)
+        cached_grad, = torch.autograd.grad(F.cross_entropy(cached[:, -1], torch.tensor([2])), actions)
+        reference_actions = actions.detach().clone().requires_grad_()
+        memory, sequence, predictions = initial, prefix, []
+        for i, action in enumerate(reference_actions.unbind(1)):
+            logits = self.model.predict_logits(memory, action)
+            predictions.append(logits)
+            if i+1 < reference_actions.size(1):
+                soft = (logits/0.8).softmax(-1) @ self.model.embedding.weight
+                sequence = torch.cat((sequence, soft[:, None]), 1)
+                states, _ = self.model.encode(embeddings=sequence)
+                memory = states[:, -1]
+        reference = torch.stack(predictions, 1)
+        reference_grad, = torch.autograd.grad(F.cross_entropy(reference[:, -1], torch.tensor([2])), reference_actions)
+        torch.testing.assert_close(cached, reference, atol=2e-6, rtol=2e-5)
+        torch.testing.assert_close(cached_grad, reference_grad, atol=2e-6, rtol=2e-4)
+        self.assertGreater(cached_grad[:, 0].abs().sum().item(), 1e-10)
+        for (k, v), (old_k, old_v) in zip(cache.layers, saved):
+            torch.testing.assert_close(k, old_k)
+            torch.testing.assert_close(v, old_v)
+
+    def test_planning_optimizes_actions_only_and_skips_goal_conditioning(self):
         before = {k: v.clone() for k, v in self.model.state_dict().items()}
+        def forbidden(*args):
+            raise AssertionError('planning must not use posterior or see goal tokens')
+        self.model.posterior = forbidden
+        self.model.action_encoder.forward = forbidden
+        seen = []
+        original = self.model.encode
+        def encode(idx=None, **kwargs):
+            seen.append((idx, kwargs))
+            return original(idx, **kwargs)
+        self.model.encode = encode
         self.model.embedding.weight.requires_grad_(False)
-        result = plan(self.model, self.tokens[:1, :3], torch.tensor([1, 2]), horizon=4, iterations=8)
+        result = plan(self.model, self.idx[:1, :3], torch.tensor([1, 2]), horizon=5, iterations=5)
         self.assertLess(result['best_loss'], result['history'][0]['loss'])
-        self.assertLess(min(h['goal_ce'] for h in result['history']), result['history'][0]['goal_ce'])
+        # One prompt prefill; six candidates plus final decode, four feedback steps each.
+        self.assertEqual(len(seen), 1 + 7*4)
+        torch.testing.assert_close(seen[0][0], self.idx[:1, :3])
+        self.assertTrue(all(idx is None and 'embeddings' in kwargs for idx, kwargs in seen[1:]))
+        for item in result['history']:
+            self.assertEqual(item['loss'], item['goal_ce'])
+        self.assertEqual(result['tokens'].shape, (1, 5))
+        torch.testing.assert_close(result['goal_tokens'], result['tokens'][:, -2:])
         self.assertTrue(self.model.training)
         self.assertFalse(self.model.embedding.weight.requires_grad)
         self.assertTrue(self.model.head.weight.requires_grad)
-        for k, v in self.model.state_dict().items():
-            torch.testing.assert_close(v, before[k])
-        self.assertEqual(result['tokens'].shape, (1, 4))
-        self.assertEqual(result['goal_tokens'].shape, (1, 2))
+        for key, value in self.model.state_dict().items():
+            torch.testing.assert_close(value, before[key])
 
-    def test_planning_decodes_prompt_memory_before_transitions(self):
+    def test_one_action_plan_needs_no_feedback(self):
         self.model.eval()
-        prompt = self.tokens[:1, :3]
-        initial = self.model.compress(prompt)[:, -1]
-        seen, transitions, outputs = [], [], []
-        head_hook = self.model.head.register_forward_pre_hook(lambda module, args: seen.append(args[0].detach().clone()))
-        original = self.model.transition
-        def transition(memory, action):
-            transitions.append(action)
-            result = original(memory, action)
-            outputs.append(result.detach().clone())
-            return result
-        self.model.transition = transition
-        try:
-            result = plan(self.model, prompt, torch.tensor([1, 2]), horizon=4, iterations=2)
-        finally:
-            head_hook.remove()
-        # Three objective evaluations plus final decode, each using H-1 actions.
-        self.assertEqual(len(transitions), 4*3)
-        torch.testing.assert_close(seen[-1][:, 0], initial)
-        torch.testing.assert_close(seen[-1][:, 1:], torch.stack(outputs[-3:], dim=1))
-        self.assertEqual(result['tokens'].size(1), 4)
+        result = plan(self.model, self.idx[:1, :2], torch.tensor([1]), horizon=1, iterations=2)
+        self.assertLess(result['best_loss'], result['history'][0]['loss'])
+        self.assertEqual(result['tokens'].shape, (1, 1))
 
-    def test_one_token_plan_uses_only_prompt_memory(self):
-        self.model.eval()
-        prompt = self.tokens[:1, :3]
-        result = plan(self.model, prompt, torch.tensor([1]), horizon=1, iterations=2)
-        expected = self.model.head(self.model.compress(prompt)[:, -1]).argmax(-1)
-        torch.testing.assert_close(result['tokens'][:, 0], expected)
-        self.assertEqual(len(result['history']), 1)
-        for h in result['history']:
-            self.assertEqual(h['loss'], h['goal_ce'])
-            self.assertNotIn('action_l2', h)
+    def test_invalid_encoding_inputs(self):
+        with self.assertRaises(ValueError):
+            self.model.encode()
+        with self.assertRaises(ValueError):
+            self.model.encode(self.idx, embeddings=self.model.embedding(self.idx))
+        with self.assertRaises(ValueError):
+            plan(self.model, self.idx, torch.tensor([1]), temperature=0)
 
-    def test_terminal_goal_gradients_reach_first_action(self):
-        memory = self.model.compress(self.tokens[:1, :3])[:, -1].detach()
-        actions = torch.randn(1, 5, 4, requires_grad=True)
-        terminal, _ = rollout(self.model, memory, actions)
-        loss = F.cross_entropy(self.model.head(terminal), torch.tensor([2]))
-        gradient, = torch.autograd.grad(loss, actions)
-        self.assertGreater(gradient[:, 0].abs().sum().item(), 0.)
-        self.assertTrue(torch.isfinite(gradient).all())
-
-    def test_planning_never_encodes_goal_tokens(self):
-        def forbidden(*args):
-            raise AssertionError('planning must not use the action encoder')
-        self.model.posterior = forbidden
-        self.model.action_encoder.forward = forbidden
-        calls = []
-        original = self.model.compress
-        def compress(tokens):
-            calls.append(tokens.clone())
-            return original(tokens)
-        self.model.compress = compress
-        result = plan(self.model, self.tokens[:1, :3], torch.tensor([1, 2]), horizon=4, iterations=2)
-        self.assertEqual(len(calls), 1)
-        torch.testing.assert_close(calls[0], self.tokens[:1, :3])
-        torch.testing.assert_close(result['goal_tokens'], result['tokens'][:, -2:])
-        self.assertIn(result['goal_exact_match'], (0., 1.))
+    def test_autocast_preserves_attention_dtypes_and_eqm_gradients(self):
+        with torch.autocast(device_type='cpu', dtype=torch.bfloat16):
+            values = self.model(self.idx, self.targets, eqm_weight=0.1, eqm_chunk_size=3)
+        values['loss'].backward()
+        for name, p in self.model.named_parameters():
+            self.assertIsNotNone(p.grad, name)
+            self.assertTrue(torch.isfinite(p.grad).all(), name)
 
 
 if __name__ == '__main__':

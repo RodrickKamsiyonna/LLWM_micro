@@ -1,1 +1,1 @@
-from .model import ModelConfig, WorldModel
+from .model import KVCache, ModelConfig, WorldModel

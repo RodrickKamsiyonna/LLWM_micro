@@ -16,11 +16,13 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from llwm import ModelConfig, WorldModel
 from llwm.planning import plan
 
+LOSS_KEYS = ('loss', 'ce', 'kl', 'eqm')
+
 
 def arguments():
     p = argparse.ArgumentParser(description='Character-level latent-action world model')
     p.add_argument('--data', default='data/input.txt')
-    p.add_argument('--out', default='checkpoints')
+    p.add_argument('--out', default='checkpoints/token_action')
     p.add_argument('--resume')
     p.add_argument('--steps', type=int, default=20000)
     p.add_argument('--batch-size', type=int, default=16, help='per GPU')
@@ -35,9 +37,8 @@ def arguments():
     p.add_argument('--lr', type=float, default=3e-4)
     p.add_argument('--warmup', type=int, default=200)
     p.add_argument('--kl-weight', type=float, default=0.001)
-    p.add_argument('--mse-weight', type=float, default=1.)
     p.add_argument('--ce-weight', type=float, default=1.)
-    p.add_argument('--eqm-weight', type=float, default=0., help='legacy EQM objective; disabled by default')
+    p.add_argument('--eqm-weight', type=float, default=0., help='optional equilibrium matching; zero skips computation')
     p.add_argument('--disable-eqm', action='store_true', help='skip EQM computation in training and validation; overrides --eqm-weight')
     p.add_argument('--eqm-lambda', type=float, default=1.)
     p.add_argument('--eqm-chunk-size', type=int, default=128)
@@ -47,6 +48,7 @@ def arguments():
     p.add_argument('--plan-horizon', type=int, default=500)
     p.add_argument('--plan-iterations', type=int, default=100)
     p.add_argument('--plan-lr', type=float, default=0.05)
+    p.add_argument('--plan-temperature', type=float, default=1.)
     p.add_argument('--prompt', default='ROMEO:\n')
     p.add_argument('--goal', default=' .')
     p.add_argument('--seed', type=int, default=1337)
@@ -60,6 +62,8 @@ def arguments():
     for name in ['steps', 'batch_size', 'accumulation', 'context', 'eval_every', 'save_every', 'eval_batches', 'plan_horizon', 'plan_iterations', 'eqm_chunk_size']:
         if getattr(a, name) < 1:
             p.error(f'--{name.replace("_", "-")} must be positive')
+    if a.plan_temperature <= 0:
+        p.error('--plan-temperature must be positive')
     if not a.prompt or not a.goal:
         p.error('prompt and goal must be nonempty')
     return a
@@ -80,6 +84,8 @@ def restore_rng(state):
 
 def main():
     args = arguments()
+    loss_options = dict(kl_weight=args.kl_weight, ce_weight=args.ce_weight, eqm_weight=args.eqm_weight,
+                        eqm_lambda=args.eqm_lambda, eqm_chunk_size=args.eqm_chunk_size)
     world = int(os.environ.get('WORLD_SIZE', 1))
     rank = int(os.environ.get('RANK', 0))
     local = int(os.environ.get('LOCAL_RANK', 0))
@@ -115,20 +121,21 @@ def main():
     def batch(which):
         source = datasets[which]
         starts = torch.randint(len(source)-args.context, (args.batch_size,))
-        return torch.stack([source[i:i+args.context+1] for i in starts]).to(device)
+        window = torch.stack([source[i:i+args.context+1] for i in starts]).to(device)
+        return window[:, :-1], window[:, 1:]
     config = ModelConfig(len(chars), args.context, args.width, args.heads, args.compressor_layers, args.predictor_layers, args.action_dim, args.dropout)
     raw = WorldModel(config).to(device)
     optimizer = torch.optim.AdamW(raw.parameters(), lr=args.lr, weight_decay=0.01)
     scaler = (torch.amp.GradScaler('cuda', enabled=cuda) if hasattr(torch.amp, 'GradScaler')
               else torch.cuda.amp.GradScaler(enabled=cuda))
     start, best_val, run_id = 0, float('inf'), None
-    loss_signature = {'objective': 'memory_pair_compressor_ce_v4', 'ce': args.ce_weight, 'mse': args.mse_weight,
+    loss_signature = {'objective': 'token_action_soft_feedback_v1', 'ce': args.ce_weight,
                       'kl': args.kl_weight, 'eqm': args.eqm_weight, 'eqm_lambda': args.eqm_lambda}
     if args.resume:
         # Checkpoints include Python/NumPy RNG state: load only trusted local files.
         ckpt = torch.load(args.resume, map_location='cpu', weights_only=False)
         if ckpt['config'] != asdict(config) or ckpt['chars'] != chars:
-            raise ValueError('checkpoint model configuration or vocabulary differs')
+            raise ValueError('checkpoint architecture/configuration or vocabulary differs; old memory-MSE checkpoints need a fresh run')
         import hashlib
         if ckpt['data_sha256'] != hashlib.sha256(text.encode()).hexdigest():
             raise ValueError('checkpoint dataset differs')
@@ -159,18 +166,18 @@ def main():
                              id=run_id, resume='allow' if run_id else None, settings=settings)
         print(f'{sum(p.numel() for p in raw.parameters()):,} parameters; effective batch {args.batch_size*args.accumulation*world}', flush=True)
     def reduced(values):
-        v = torch.stack([values[k].detach().float() for k in ['loss', 'ce', 'mse', 'kl', 'eqm']])
+        v = torch.stack([values[k].detach().float() for k in LOSS_KEYS])
         if world > 1:
             dist.all_reduce(v)
             v /= world
-        return dict(zip(['loss', 'ce', 'mse', 'kl', 'eqm'], v.tolist()))
+        return dict(zip(LOSS_KEYS, v.tolist()))
     def evaluate():
         raw.eval()
-        totals = {k: torch.zeros((), device=device) for k in ['loss', 'ce', 'mse', 'kl', 'eqm']}
+        totals = {k: torch.zeros((), device=device) for k in LOSS_KEYS}
         with torch.no_grad():
             for _ in range(args.eval_batches):
                 with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=cuda):
-                    values = raw(batch('val'), args.kl_weight, args.mse_weight, args.ce_weight, args.eqm_weight, args.eqm_lambda, args.eqm_chunk_size)
+                    values = raw(*batch('val'), **loss_options)
                 for k in totals:
                     totals[k] += values[k] / args.eval_batches
         raw.train()
@@ -206,12 +213,12 @@ def main():
         for group in optimizer.param_groups:
             group['lr'] = lr
         optimizer.zero_grad(set_to_none=True)
-        totals = {k: torch.zeros((), device=device) for k in ['loss', 'ce', 'mse', 'kl', 'eqm']}
+        totals = {k: torch.zeros((), device=device) for k in LOSS_KEYS}
         for micro in range(args.accumulation):
             sync = model.no_sync() if world > 1 and micro < args.accumulation-1 else nullcontext()
             with sync:
                 with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=cuda):
-                    values = model(batch('train'), args.kl_weight, args.mse_weight, args.ce_weight, args.eqm_weight, args.eqm_lambda, args.eqm_chunk_size)
+                    values = model(*batch('train'), **loss_options)
                 if not torch.isfinite(values['loss']):
                     raise RuntimeError(f'nonfinite loss at step {step}')
                 scaler.scale(values['loss']/args.accumulation).backward()
@@ -242,7 +249,7 @@ def main():
             improved = val['loss'] < best_val
             best_val = min(best_val, val['loss'])
             if rank == 0:
-                result = plan(raw, prompt, goal, args.plan_horizon, args.plan_iterations, args.plan_lr)
+                result = plan(raw, prompt, goal, args.plan_horizon, args.plan_iterations, args.plan_lr, args.plan_temperature)
                 row = {'step': step, 'prompt': args.prompt, 'goal': args.goal, 'rollout': decode(result['tokens'][0]),
                        'predicted_goal': decode(result['goal_tokens'][0]),
                        'initial_loss': result['history'][0]['loss'], 'best_loss': result['best_loss'], 'goal_ce': result['goal_ce'], 'history': result['history']}

@@ -5,7 +5,7 @@ from torch.nn import functional as F
 
 def chunk_loss(model, memory, action, target, gamma, noise, strength, create_graph):
     mixed = (gamma * action.detach() + (1 - gamma) * noise).requires_grad_(True)
-    logits = model.head(model.transition(memory, mixed)).float()
+    logits = model.predict_logits(memory, mixed)
     energy = F.cross_entropy(logits, target, ignore_index=-1, reduction='sum')
     gradient, = torch.autograd.grad(energy, mixed, create_graph=create_graph)
     desired = (noise - action.detach()) * strength * (1 - gamma)

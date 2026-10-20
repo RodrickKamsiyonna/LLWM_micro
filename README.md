@@ -1,56 +1,27 @@
-# LLM world model: character-level Shakespeare
+# Character-level latent-action language model
 
-Four modules: a causal Transformer compressor, Gaussian action encoder, action-conditioned memory predictor with adaptive LayerNorm, and a vocabulary head. The predictor processes each training transition independently; planning recursively uses its own predicted memories.
+The compressor encodes text into causal memories. A Gaussian action encoder sees the current memory and **next-token embedding**. An action-conditioned predictor and vocabulary head reconstruct that next token. Predictor features are not next-memory targets: there is no memory MSE loss.
 
-For characters `x[0:T+1]`, the compressor produces `m[0:T+1]`. Each `m[t]` has access only to `x[:t+1]`. Training uses:
-
-```
-q(a[t] | stop_gradient(m[t]), stop_gradient(m[t+1])) = Normal(mu, exp(log_std))
-a[t] = mu + exp(log_std) * epsilon
-predicted_m[t+1] = predictor(m[t], a[t])
-logits[t+1] = head(m[t])  # attached compressor memory
-loss = ce_weight * CE(logits[t+1], x[t+1])
-     + mse_weight * MSE(predicted_m[t+1], stop_gradient(m[t+1]))
-     + kl_weight * KL(q(a[t]) || Normal(0, I))
-```
-
-The head receives **attached current compressor memory** and predicts the next character. CE directly trains both the compressor (including token/position embeddings) and the head; it does not update the predictor or action encoder. The action encoder receives detached current and next compressor memories. The predictor still takes attached current memory and the sampled action, and learns next memory through MSE against the detached next-memory target. The action encoder learns through MSE and action KL. Planning keeps gradients through predicted memories to optimize actions.
-
-Default loss weights: CE=1, MSE=1, KL=0.001, EQM=0. The active objective is CE + memory MSE + action KL. `--ce-weight` controls compressor next-token CE. EQM is no longer used in this workflow and is skipped entirely by default in both the model API and training CLI. Its implementation is retained unchanged for explicit legacy experiments. No new flag is needed to disable it; `--disable-eqm` remains available.
-
-## Legacy equilibrium matching (disabled by default)
+## Training
 
 ```text
-gamma ~ Uniform(0, 1); eps ~ Normal(0, I)
-a_gamma = gamma * detach(action) + (1 - gamma) * eps
-energy = sum_token_CE(head(predictor(memory, a_gamma)), next_tokens)
-grad_energy = d energy / d a_gamma
-desired = (eps - detach(action)) * eqm_lambda * (1 - gamma)
-eqm = mean((grad_energy - desired)**2)
+h = compressor(input_tokens)
+mu, log_std = action_encoder(detach(h), detach(embedding(next_tokens)))
+action = mu + exp(log_std) * Normal(0, I)
+features = predictor(h, action)       # adaptive LayerNorm conditioning
+logits = 15 * tanh(head(features) / 15)
+loss = ce_weight * CE(logits, next_tokens)
+     + kl_weight * KL(q(action) || Normal(0, I))
+     + eqm_weight * equilibrium_matching(h, detach(action), next_tokens)
 ```
 
-`--eqm-weight` now defaults to 0: nothing in this section is computed in the active workflow. The unchanged legacy implementation can be explicitly enabled with a positive weight. `--eqm-lambda` defaults to 1 and controls the target gradient field, while the weight controls the contribution to total loss. `--eqm-chunk-size` defaults to 128 transitions. `--disable-eqm` overrides any supplied weight. Disabled EQM logs zero and does not perform noisy predictor passes or higher-order differentiation.
+CE trains the compressor, action encoder, predictor, and head. The previously requested stop-gradients remain at both action-encoder inputs; CE reaches the compressor through the direct predictor input. The head and predictor output are **not detached**. There is no separate compressor-head CE and no predictor-memory MSE.
 
-`llwm/eqm.py` uses exact chunked recomputation. Forward evaluates the loss with a first action derivative and releases each chunk's graph. A custom backward recomputes one chunk at a time with `create_graph=True`, accumulating mixed second derivatives into parameter and memory gradients. The same gamma/noise samples are reused. This avoids retaining a full-batch second-order graph, while preserving all transitions and the original loss/gradients up to floating-point accumulation. No finite differences or subsampling are used.
-
-This trades extra recomputation and per-chunk overhead for lower EQM activation memory; it does not eliminate second derivatives or guarantee a speedup. Smaller chunks generally reduce extra activation memory and can be slower. The ordinary compressor/CE/MSE graphs still consume memory. Chunking is valid because this predictor/head process transitions independently; cross-token attention, batch-dependent layers, or stochastic predictor layers would require a different implementation.
-
-EQM runs in FP32 with autocast disabled. AMP scales only the outer gradients, never the inner energy field. Memory remains connected to the compressor. Validation computes EQM using local action gradients inside the surrounding `no_grad` context, without retaining a parameter-update graph.
-
-An isolated CPU benchmark (256 transitions, width 64, three predictor layers, action dimension 16, chunks of 32) produced the same loss for both implementations. Peak unique storage retained by autograd saves was 5.46 MiB for the full reference versus 1.14 MiB for recomputation (about 4.8x lower). Uninstrumented forward/backward time was about 44 ms versus 140 ms: recomputation was slower. This saved-storage proxy is not process RSS, full-training memory, or CUDA peak allocation.
-
-Run the benchmark on a T4 to measure actual CUDA allocator peaks and timing:
-
-```bash
-python benchmark_eqm.py --device cuda --tokens 4096 --width 256 \
-  --action-dim 32 --layers 3 --chunk-size 128
-```
-
-The benchmark isolates EQM; full training also retains the ordinary compressor/CE/MSE graphs. Tune `--eqm-chunk-size` against measured memory and throughput on your hardware.
+KL averages over valid tokens **and action dimensions**, matching the supplied VAE formula. This differs from the old implementation, which summed action dimensions. CE and KL ignore target index `-1`; an entirely ignored target batch returns finite zero losses when EQM is disabled. Next-token embeddings clamp ignored indices to zero before lookup. Training uses FP16 autocast/gradient scaling on CUDA and FP32 on CPU.
 
 ## Run on two T4 GPUs
 
-Use Python 3.10+ and a CUDA-enabled PyTorch installation appropriate for your machine.
+Use Python 3.10+ and a CUDA-enabled PyTorch installation appropriate for your system:
 
 ```bash
 python -m venv .venv
@@ -58,56 +29,88 @@ source .venv/bin/activate
 pip install -r requirements.txt
 python prepare.py
 wandb login
-torchrun --standalone --nproc_per_node=2 train.py --run-name shakespeare-world-model
+torchrun --standalone --nproc_per_node=2 train.py \
+  --steps 20000 --context 256 --batch-size 16 --accumulation 4 \
+  --width 256 --heads 4 --compressor-layers 4 --predictor-layers 3 \
+  --action-dim 32 --lr 3e-4 --warmup 200 \
+  --ce-weight 1 --kl-weight 0.001 \
+  --eqm-weight 0 \
+  --plan-horizon 500 --plan-iterations 100 --plan-lr 0.05 \
+  --plan-temperature 1 --goal ' .' --run-name token-action
 ```
 
-Dataset: [Karpathy's Tiny Shakespeare](https://github.com/karpathy/char-rnn/tree/master/data/tinyshakespeare), with a contiguous 90% training / 10% validation split and a character vocabulary. The download is explicit; training can also read an existing UTF-8 file with `--data`.
+Defaults are shown above. Compressor/predictor feed-forward dimension is `4*width`; the action encoder has two linear layers, hidden dimension `2*width`, and outputs action mean/log standard deviation. Dropout defaults to 0.1. Width must be divisible by the head count, with an even per-head dimension for rotary positions. The model uses rotary positions and a sliding causal attention window of `--context` tokens. Positions can extend past the training context during planning.
 
-Defaults: 20,000 optimizer steps, context 256, width 256, four compressor layers, three predictor layers, 32-dimensional actions. Each GPU samples 16 independent random windows per microbatch, with four accumulation microsteps: effective batch 128 windows across two GPUs. DDP synchronizes gradients on the last microstep. CUDA uses FP16 autocast and gradient scaling, suitable for T4 GPUs; GPU memory and throughput need measurement on your hardware. Reduce `--batch-size` or `--context` if needed. CPU uses FP32. See [PyTorch DDP documentation](https://docs.pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html) and [AMP examples](https://docs.pytorch.org/docs/stable/notes/amp_examples.html).
+Each GPU samples independent random windows. Two GPUs with batch size 16 and four accumulation microsteps give 128 sequences per optimizer update. AdamW uses weight decay 0.01; learning rate warms up over 200 steps, then follows cosine decay to 10% of the peak. `--eval-every` and `--save-every` default to 500 optimizer steps. Validation/planning also run at the final step. Overflow attempts are retried without counting as completed optimizer updates.
 
-Every 500 optimizer steps (and at the final step), validation and planning run. Checkpoints are saved every 500 steps, on validation improvement, and at the end. Numbered checkpoint files retain history; `latest.pt` and `best.pt` point to the relevant files. Resume with the same model/data/training arguments and `--resume checkpoints/latest.pt`. Checkpoints restore model, AdamW, scaler, step, best validation loss, vocabulary, W&B ID, and per-rank Python/NumPy/Torch/CUDA RNG state. Keep world size unchanged for RNG continuity. Keep total `--steps` unchanged to preserve the learning-rate schedule. Only load trusted checkpoints.
+The dataset is [Karpathy's Tiny Shakespeare](https://github.com/karpathy/char-rnn/tree/master/data/tinyshakespeare), split contiguously into 90% training and 10% validation. `prepare.py` explicitly downloads it; `--data` can point to another UTF-8 text file.
 
-W&B logs total loss, raw CE/MSE/KL/EQM, learning rate, gradient norm, validation losses, planning objective history, and a table of generated text. `--wandb-mode offline` records locally; `--wandb-mode disabled` needs no account. Planning results also go to `checkpoints/plan_STEP.json`.
+## Planning with soft embeddings and a differentiable KV cache
 
-## Planning semantics
+Compress the prompt once, then optimize one initially Gaussian action per generated token:
 
-The prompt is compressed once. A 500-token horizon uses **499 initially Gaussian actions and transitions**. The first next-token prediction comes from the prompt's last memory; each transition supplies the memory used to predict the subsequent token. Predicted memory becomes the next predictor input. The model is frozen and dropout disabled; only actions are optimized. Neither the compressor nor the action encoder runs inside the optimization loop.
-
-The goal string (default `" ."`) is used **only as a cross-entropy target** for the final `len(goal)` positions of the 500-token rollout. No goal character or its embedding is fed into any module. All goal positions are reached using optimized actions and recursively predicted memories. Multi-character goals are scored jointly on that same free rollout, with no teacher forcing.
-
+```text
+h, prefix_cache = compressor(prompt)  # computed once, without gradients
+cache = prefix_cache
+for t in range(horizon):
+    logits[t] = head(predictor(h, actions[t]))  # same capped logits as training
+    if t + 1 < horizon:
+        probabilities = softmax(logits[t] / temperature)
+        soft_embedding = probabilities @ token_embedding_table
+        h, cache = compressor(soft_embedding, cache)
+planning_loss = CE(logits[-len(goal):], goal)
 ```
-memory = compressor(prompt)[-1]  # once, detached
-logits[0] = head(memory)
-for t in range(horizon - 1):
-    memory = predictor(memory, optimized_actions[t])
-    logits[t + 1] = head(memory)
-loss = CE(logits[-len(goal):], goal)
+
+A soft embedding is the probability-weighted expected token embedding, not a raw-logit-weighted vector or a random sample. `--plan-temperature` controls the softmax temperature and defaults to 1. Every subsequent memory comes from re-encoding the previous soft token through the compressor. **Predictor features are never fed back as memory.** A 500-token plan has 500 actions/predictions and 499 soft-feedback compressor updates after the prompt.
+
+The prompt is truncated to the final context-length tokens. Its prefix cache is reused across optimization iterations. Generated-token K/V caches remain differentiable: detaching them would cut goal gradients to earlier actions. Cache updates are out of place, so the original prefix cache is never mutated. Each layer retains at most `context-1` previous K/V positions; adding the next token forms a context-length attention window. Single-query decoding attends to all retained past keys, rather than using an incorrectly aligned causal mask. Rotary positions continue increasing as the window slides.
+
+Caching saves repeated prefix computation. It does not make planning's backward graph constant-memory: generated states/caches must remain connected across the horizon. Attention uses PyTorch scaled-dot-product attention. All model parameters are frozen during planning and restored afterward; only actions are optimized. No action encoder, goal embeddings, action regularizer, or memory MSE is used in planning. Goal characters are CE targets only. There is no final unnecessary soft-feedback update after the last prediction.
+
+Planning uses Adam for 100 iterations at learning rate 0.05 by default. The initialized candidate and final update are included when selecting the best goal loss. Logged text is the argmax decoding of the **soft-feedback trajectory**; feeding those hard argmax tokens back could produce a different trajectory. A low soft planning loss does not guarantee successful discrete generation or coherent intermediate text. Exact match checks the actual decoded soft-rollout suffix, not appended target text.
+
+## Optional exact equilibrium matching
+
+EQM is retained with the memory-efficient implementation and is disabled by default. Enable it with a positive weight, for example `--eqm-weight 0.1 --eqm-lambda 1 --eqm-chunk-size 128`. `--disable-eqm` forces weight zero even if another weight is supplied. Zero weight skips computation entirely in training and validation and logs EQM as zero.
+
+```text
+gamma ~ Uniform(0, 1); eps ~ Normal(0, I)
+a_gamma = gamma * detach(action) + (1 - gamma) * eps
+energy = sum_token_CE(predict_logits(h, a_gamma), next_tokens)
+grad_energy = d energy / d a_gamma
+desired = (eps - detach(action)) * eqm_lambda * (1 - gamma)
+eqm = mean((grad_energy - desired)**2)
 ```
 
-Planning uses only goal CE. There is no action regularizer and no `--plan-action-weight` option. The best objective candidate, including initialization and the final update, is retained. W&B and JSON contain the full decoded `rollout`, the actual decoded `predicted_goal` suffix, goal CE at every planning iteration, and `goal_exact_match`. Exact match checks **every** character of the suffix. Optimizing the loss cannot guarantee a match; the recorded match value reports whether it succeeded. No target text is appended to the generated output.
+`eqm_lambda` sets the desired gradient field; `eqm_weight` sets this loss's contribution. The EQM energy uses the same smooth-capped logits as CE and planning. Its inner CE is **summed**, preserving the supplied action-gradient scale. Sampled actions are detached in EQM, while memory remains connected to the compressor.
+
+`llwm/eqm.py` processes independent predictor transitions in chunks. Forward computes the EQM value with first action derivatives and frees each chunk's graph. Custom backward recomputes each chunk with `create_graph=True`, accumulating exact parameter and memory gradients. Gamma/noise samples are reused. There is no finite-difference approximation or subsampling. Second derivatives are still required mathematically; recomputation trades extra work for lower saved activation memory. Smaller chunks generally save more memory and can be slower. This relies on the predictor/head operating independently across tokens.
+
+EQM runs in FP32 with autocast disabled. AMP scales only the outer gradients. Validation computes local action derivatives even inside its surrounding `no_grad` context. The comparison benchmark measures isolated EQM, not full training:
 
 ```bash
-torchrun --standalone --nproc_per_node=2 train.py \
-  --goal 'THE END.' --plan-horizon 500 --plan-iterations 100
+python benchmark_eqm.py --device cuda --tokens 4096 --width 256 \
+  --action-dim 32 --layers 3 --chunk-size 128
 ```
 
-The head is now trained as `head(m[t]) -> x[t+1]`; applying it to predicted `m[t+1]` predicts `x[t+2]`. Planning includes the prompt memory first to avoid skipping its next token. A one-token horizon uses no actions, so its prediction cannot be changed by optimizing future actions. Goal text is never a model input.
+CPU saved-storage measurements are a proxy, not RSS or CUDA allocator peaks. Measure actual T4 memory/throughput before selecting a chunk size.
 
-The horizon includes the goal: this example generates 500 tokens total, with the last eight positions optimized toward `THE END.`. Long differentiable rollouts can be expensive and can exploit model errors. A low goal loss does not guarantee coherent intermediate text or a realizable character-level trajectory. Predicted memories need not equal compressor memories for the decoded path. This baseline implements one-step training as requested; multi-step consistency would be a separate experiment. Rank zero plans while other ranks wait, with a four-hour collective timeout. Planning restores training mode, parameter gradient flags, and training RNG streams.
+## Logging, checkpoints, and compatibility
 
-## Checks
+W&B is online by default (`wandb login`). `--wandb-mode offline` saves locally; `disabled` turns logging off. Rank zero logs total loss and individual CE/KL/EQM in training and validation, learning rate, gradient norm, and planning text/history. `--project` and `--run-name` customize the run. No obsolete MSE metric is logged.
+
+The new default output directory is `checkpoints/token_action`, preserving older experiment artifacts. Numbered checkpoints retain model/optimizer/scaler, configuration, vocabulary, dataset hash, step, best validation loss, W&B ID, and per-rank Python/NumPy/Torch/CUDA RNG state. `latest.pt` and `best.pt` point to relevant files. Planning results are also written as `plan_STEP.json`.
+
+**Old memory-MSE/learned-position checkpoints are incompatible; start a fresh run.** Resume new checkpoints with matching arguments and `--resume checkpoints/token_action/latest.pt`. Keep world size and total steps unchanged for RNG and learning-rate continuity. Only load trusted checkpoint files. Changing loss weights resets the stored best validation loss for comparison.
+
+## Verification
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-Tests cover causal attention, next-token alignment, detached targets, finite gradients, planning improvement without changing model parameters, and exclusion of the action encoder and goal tokens from planning inputs. A quick end-to-end run:
+Tests cover next-token CE and per-dimension KL, all-module CE gradients, detached action-encoder inputs, ignored targets, full-versus-cached attention beyond the context window, cached multi-token appends, context length one, immutable prefix caches, and cached soft-rollout/action-gradient equivalence to full recomputation. EQM tests compare values and all parameter gradients with the full reference and check disabled execution, loss scaling, and saved-tensor hooks.
 
-```bash
-python train.py --device cpu --wandb-mode disabled --steps 2 \
-  --width 16 --heads 2 --compressor-layers 1 --predictor-layers 1 \
-  --action-dim 4 --context 16 --batch-size 2 --accumulation 1 \
-  --eval-batches 1 --plan-horizon 4 --plan-iterations 2
-```
+All 18 tests passed, including CPU mixed precision with EQM and differentiable cache equivalence. A two-process CPU/Gloo run completed training with optional EQM, gradient accumulation, validation, cached planning, checkpointing, and offline W&B logging of CE/KL/EQM. A small CPU configuration completed a 500-step soft rollout with decreasing goal loss. Resuming a checkpoint exactly reproduced model/optimizer/scaler/RNG state, validation loss, and planning JSON.
 
-Local CPU checks use PyTorch 2.2.2, NumPy 1.26.4, and W&B 0.18.7 on an Intel Mac. All 18 tests passed, including attached compressor CE gradients, memory-pair action encoding, detached encoder inputs, default EQM disabling, unchanged legacy EQM equivalence, and planning alignment. A two-process CPU/Gloo run completed training with gradient accumulation, validation, planning, and checkpoint saving using compressor CE and EQM disabled by default. CUDA FP16, peak GPU memory, and NCCL behavior remain unverified on this machine; requirements target PyTorch 2.4+ for the GPU run.
+Local verification uses PyTorch 2.2.2/NumPy 1.26.4/W&B 0.18.7 on an Intel Mac. The GPU requirements target PyTorch 2.4+. Actual T4 FP16/NCCL performance and peak GPU memory remain unverified locally.
