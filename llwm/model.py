@@ -3,6 +3,7 @@ import math
 import torch
 from torch import nn
 from torch.nn import functional as F
+from .eqm import equilibrium_matching_loss
 
 
 @dataclass
@@ -134,13 +135,19 @@ class WorldModel(nn.Module):
         logits = self.head(memory).float()
         return 15 * torch.tanh(logits/15)
 
-    def forward(self, idx, targets, *, target_kl, kl_lambda=1., ce_weight=1., mse_weight=1.):
+    def forward(self, idx, targets, *, target_kl, kl_lambda=1., ce_weight=1., mse_weight=1.,
+                eqm_weight=0., eqm_lambda=1., eqm_chunk_size=128):
         if not math.isfinite(target_kl) or target_kl < 0:
             raise ValueError('target_kl must be finite and nonnegative')
         if not math.isfinite(kl_lambda) or kl_lambda < 0:
             raise ValueError('kl_lambda must be finite and nonnegative')
         if not math.isfinite(mse_weight) or mse_weight < 0:
             raise ValueError('mse_weight must be finite and nonnegative')
+        for name, value in [('eqm_weight', eqm_weight), ('eqm_lambda', eqm_lambda)]:
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f'{name} must be finite and nonnegative')
+        if eqm_chunk_size < 0:
+            raise ValueError('eqm_chunk_size must be nonnegative')
         if idx.shape != targets.shape:
             raise ValueError('idx and targets must have matching [batch, sequence] shapes')
         h, cache = self.encode(idx)
@@ -166,5 +173,10 @@ class WorldModel(nn.Module):
         kl_total = kl*self.config.action_dim
         kl_excess = F.relu(kl_total-target_kl)
         kl_penalty = kl_lambda*kl_excess.square()
-        return {'loss': ce_weight*ce + kl_penalty + mse_weight*mse, 'ce': ce, 'mse': mse, 'kl': kl,
+        eqm = (equilibrium_matching_loss(self, h, action, targets, eqm_lambda=eqm_lambda,
+                                         chunk_size=eqm_chunk_size)
+               if eqm_weight else logits.new_zeros(()))
+        eqm_penalty = eqm_weight*eqm
+        return {'loss': ce_weight*ce + kl_penalty + mse_weight*mse + eqm_penalty,
+                'eqm': eqm, 'eqm_penalty': eqm_penalty, 'ce': ce, 'mse': mse, 'kl': kl,
                 'kl_total': kl_total, 'kl_excess': kl_excess, 'kl_penalty': kl_penalty}

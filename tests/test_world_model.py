@@ -37,7 +37,7 @@ class WorldModelTests(unittest.TestCase):
             torch.distributions.Normal(torch.zeros_like(mean), torch.ones_like(mean))).mean()
         torch.testing.assert_close(values['ce'], expected_ce)
         torch.testing.assert_close(values['kl'], expected_kl)
-        self.assertEqual(set(values), {'loss', 'ce', 'kl', 'kl_total', 'kl_excess', 'kl_penalty', 'mse'})
+        self.assertEqual(set(values), {'loss', 'ce', 'kl', 'kl_total', 'kl_excess', 'kl_penalty', 'mse', 'eqm', 'eqm_penalty'})
         values['ce'].backward()
         for name, p in self.model.named_parameters():
             self.assertIsNotNone(p.grad, name)

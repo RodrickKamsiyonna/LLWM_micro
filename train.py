@@ -16,7 +16,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from llwm import ModelConfig, WorldModel
 from llwm.planning import plan
 
-LOSS_KEYS = ('loss', 'ce', 'kl', 'kl_total', 'kl_excess', 'kl_penalty', 'mse')
+LOSS_KEYS = ('loss', 'ce', 'kl', 'kl_total', 'kl_excess', 'kl_penalty', 'mse', 'eqm', 'eqm_penalty')
 
 
 def arguments():
@@ -41,6 +41,9 @@ def arguments():
     p.add_argument('--kl-steps', type=int, default=0, help='linear coefficient warmup in optimizer updates; 0 disables, 1 reaches full strength immediately')
     p.add_argument('--ce-weight', type=float, default=1.)
     p.add_argument('--mse-weight', type=float, default=1., help='next-memory MSE coefficient')
+    p.add_argument('--eqm-weight', type=float, default=0., help='EQM loss coefficient; 0 skips computation')
+    p.add_argument('--eqm-lambda', type=float, default=1., help='target action-gradient field scale')
+    p.add_argument('--eqm-chunk-size', type=int, default=128, help='valid transitions per recomputed EQM chunk; 0 uses all')
     p.add_argument('--eval-every', type=int, default=500)
     p.add_argument('--save-every', type=int, default=500)
     p.add_argument('--eval-batches', type=int, default=20)
@@ -69,6 +72,11 @@ def arguments():
         p.error('--mse-weight must be finite and nonnegative')
     if not math.isfinite(a.plan_consistency_weight) or a.plan_consistency_weight < 0:
         p.error('--plan-consistency-weight must be finite and nonnegative')
+    for name in ['eqm_weight', 'eqm_lambda']:
+        if not math.isfinite(getattr(a, name)) or getattr(a, name) < 0:
+            p.error(f'--{name.replace("_", "-")} must be finite and nonnegative')
+    if a.eqm_chunk_size < 0:
+        p.error('--eqm-chunk-size must be nonnegative')
     if not a.prompt or not a.goal:
         p.error('prompt and goal must be nonempty')
     return a
@@ -100,7 +108,8 @@ def restore_rng(state):
 
 def main():
     args = arguments()
-    loss_options = dict(target_kl=args.target_kl, kl_lambda=args.kl_lambda, ce_weight=args.ce_weight, mse_weight=args.mse_weight)
+    loss_options = dict(target_kl=args.target_kl, kl_lambda=args.kl_lambda, ce_weight=args.ce_weight, mse_weight=args.mse_weight,
+                        eqm_weight=args.eqm_weight, eqm_lambda=args.eqm_lambda, eqm_chunk_size=args.eqm_chunk_size)
     world = int(os.environ.get('WORLD_SIZE', 1))
     rank = int(os.environ.get('RANK', 0))
     local = int(os.environ.get('LOCAL_RANK', 0))
@@ -144,7 +153,8 @@ def main():
     scaler = (torch.amp.GradScaler('cuda', enabled=cuda) if hasattr(torch.amp, 'GradScaler')
               else torch.cuda.amp.GradScaler(enabled=cuda))
     start, best_val, run_id = 0, float('inf'), None
-    loss_signature = {'objective': 'memory_pair_action_kl_budget_v4', 'ce': args.ce_weight, 'mse': args.mse_weight,
+    loss_signature = {'objective': 'memory_pair_action_eqm_v5', 'ce': args.ce_weight, 'mse': args.mse_weight,
+                      'eqm_weight': args.eqm_weight, 'eqm_lambda': args.eqm_lambda,
                       'target_kl': args.target_kl, 'kl_lambda': args.kl_lambda, 'kl_steps': args.kl_steps}
     if args.resume:
         # Checkpoints include Python/NumPy RNG state: load only trusted local files.
