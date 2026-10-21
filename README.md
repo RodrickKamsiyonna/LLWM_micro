@@ -68,7 +68,18 @@ The noisy action is a fresh detached gradient input: EQM does not train the acti
 
 `--eqm-chunk-size` counts valid memory/action/token transitions, flattened across batch and sequence. The default 128 processes at most 128 transitions in each EQM predictor call; 0 uses all valid transitions in one chunk. All valid transitions contribute, including the final partial chunk, with normalization by the total valid-token count times action dimension. Ignored tokens (`-1`) are excluded. No transitions are subsampled. Noise is sampled before chunking so chunk size does not change the sampled objective.
 
-Each training chunk uses non-reentrant activation checkpointing: its higher-order predictor graph is recomputed during backward instead of keeping all chunk activations alive. Chunking alone would not provide this saving if every second-order graph were retained until backward. This preserves the exact EQM objective and gradients, with extra recomputation; it does not eliminate the shared compressor graph or all second-order compute. Smaller chunks reduce per-chunk activation memory but add overhead. EQM runs its predictor/head calculation and action derivative in FP32, including under AMP. Validation locally enables the action derivative but creates no parameter-gradient graph. W&B logs raw `train/eqm`, `val/eqm` and weighted `train/eqm_penalty`, `val/eqm_penalty`. These settings are saved in checkpoints, and changing EQM weight or field scale resets best validation loss.
+EQM restores the custom-autograd recomputation strategy from commit `327fe65`. Forward computes only the first action derivative and releases each chunk graph. Backward rebuilds one chunk with `create_graph=True`, computes its parameter and memory gradients, accumulates those tensors, and releases the graph before constructing the next chunk. It does not use the checkpoint-based implementation introduced in `b7b76be`.
+
+Local memory leaves inside custom backward isolate recomputation; their gradients are explicitly returned to the original attached compressor memory. This preserves compressor gradients while the noisy action and target action stay detached. AMP's outer loss scale is applied only after differentiating the chunk, never to the inner CE field. Smaller chunks reduce per-chunk activation storage but add overhead. The shared compressor and ordinary CE/MSE graphs still consume memory. Validation computes first action derivatives without keeping a parameter-update graph.
+
+In an isolated CPU benchmark (256 transitions, width 64, three predictor layers, action dimension 16, chunks of 32), full EQM and recomputation both returned loss 0.6695118. Peak unique storage retained by autograd saves fell from 5,857,028 to 1,211,528 bytes (about 4.8x lower); time rose from about 44 to 132 ms. This saved-storage proxy is not process RSS or CUDA allocator memory. Measure actual T4 peaks with:
+
+```bash
+python benchmark_eqm.py --device cuda --tokens 4096 --width 256 \
+  --action-dim 32 --layers 3 --chunk-size 128
+```
+
+W&B logs raw `train/eqm`, `val/eqm` and weighted `train/eqm_penalty`, `val/eqm_penalty`. These settings are saved in checkpoints, and changing EQM weight or field scale resets best validation loss.
 
 ## Run on two T4 GPUs
 
@@ -135,6 +146,6 @@ python -m unittest discover -s tests -v
 
 Tests cover next-token CE and per-dimension KL, analytical KL totals and budget gradients, coefficient ramp endpoints, ignored targets, all-module CE gradients, detached action-encoder inputs, full-versus-cached sliding attention, next-memory target alignment and stop-gradients, and autoregressive memory-rollout/action gradients. Planning tests assert that the compressor is called exactly once and goal tokens never enter the model. CPU mixed-precision gradients are checked as well.
 
-All 33 tests passed, including exact EQM loss/parameter-gradient comparisons against a direct second-order reference at chunk sizes 1, 3, and full batch, attached compressor-memory gradients, detached sampled actions, skipped disabled computation, validation, and CPU mixed precision. Tests also cover memory-pair inference and inverse-consistency planning. A two-process CPU/Gloo smoke run completed CE, KL warmup, MSE and chunked EQM training, validation, memory-space planning with inverse consistency, and checkpoint saving. Offline W&B recorded raw and weighted EQM for training and validation. Actual T4 execution remains unverified locally.
+All 35 tests passed. EQM regression tests include exact loss/parameter-gradient comparisons against a direct second-order reference at chunk sizes 1, 3, and full batch, attached compressor-memory gradients, detached sampled actions, skipped disabled computation, validation, CPU mixed precision, outer gradient scaling, saved-tensor-hook compatibility, and peak saved-storage reduction. Tests also cover memory-pair inference and inverse-consistency planning. A two-process CPU/Gloo smoke run completed training with gradient accumulation, validation, planning and checkpoint saving using the restored custom backward. Actual T4 execution and resolution of the reported GPU training OOM remain unverified locally.
 
 Local verification uses PyTorch 2.2.2/NumPy 1.26.4/W&B 0.18.7 on an Intel Mac. The GPU requirements target PyTorch 2.4+. Actual T4 FP16/NCCL performance and peak GPU memory remain unverified locally.

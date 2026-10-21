@@ -96,3 +96,46 @@ class EQMTests(unittest.TestCase):
             with patch('sys.argv', ['train.py', '--target-kl', '1', option, value]), patch('sys.stderr', io.StringIO()):
                 with self.assertRaises(SystemExit):
                     arguments()
+
+    def test_outer_scaling_and_saved_tensor_hooks_preserve_gradients(self):
+        state = torch.get_rng_state()
+        result = self.model(self.idx, self.targets, target_kl=1., eqm_weight=1., eqm_chunk_size=3)
+        result['eqm'].backward()
+        expected = [p.grad.clone() if p.grad is not None else None for p in self.model.parameters()]
+        self.model.zero_grad(set_to_none=True)
+        torch.set_rng_state(state)
+        with torch.autograd.graph.saved_tensors_hooks(lambda t: t.detach(), lambda t: t):
+            result = self.model(self.idx, self.targets, target_kl=1., eqm_weight=1., eqm_chunk_size=3)
+            (128*result['eqm']).backward()
+        for (name, param), gradient in zip(self.model.named_parameters(), expected):
+            self.assertEqual(param.grad is None, gradient is None, name)
+            if gradient is not None:
+                torch.testing.assert_close(param.grad, 128*gradient, msg=name)
+
+    def test_recomputation_reduces_peak_saved_storage(self):
+        from benchmark_eqm import SavedStorage
+        from llwm.eqm import chunk_loss
+        model = WorldModel(ModelConfig(16, width=64, heads=4, compressor_layers=1,
+                                       predictor_layers=3, action_dim=16, dropout=0.))
+        memory = torch.randn(1, 256, 64, requires_grad=True)
+        action = torch.randn(1, 256, 16)
+        targets = torch.randint(16, (1, 256))
+        peaks, values = [], []
+        for recomputed in [False, True]:
+            model.zero_grad(set_to_none=True)
+            memory.grad = None
+            tracker = SavedStorage()
+            torch.manual_seed(23)
+            with torch.autograd.graph.saved_tensors_hooks(tracker.pack, lambda held: held.tensor):
+                if recomputed:
+                    loss = equilibrium_matching_loss(model, memory, action, targets, chunk_size=32)
+                else:
+                    gamma = torch.rand(256, 1)
+                    noise = torch.randn(256, 16)
+                    loss = chunk_loss(model, memory.reshape(-1, 64), action.reshape(-1, 16),
+                                      targets.flatten(), gamma, noise, 1., True)
+                values.append(loss.detach())
+                loss.backward()
+            peaks.append(tracker.peak)
+        torch.testing.assert_close(values[0], values[1])
+        self.assertLess(peaks[1], peaks[0]/2)
