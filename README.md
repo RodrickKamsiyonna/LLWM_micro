@@ -81,6 +81,28 @@ python benchmark_eqm.py --device cuda --tokens 4096 --width 256 \
 
 W&B logs raw `train/eqm`, `val/eqm` and weighted `train/eqm_penalty`, `val/eqm_penalty`. These settings are saved in checkpoints, and changing EQM weight or field scale resets best validation loss.
 
+## Dataset selection: Shakespeare or WikiText-2 (character-level)
+
+The default `--dataset shakespeare` downloads Tiny Shakespeare. To train on the **small WikiText-2 raw dataset** instead, use `--dataset wikitext`. The dataset is [Salesforce/wikitext](https://huggingface.co/datasets/Salesforce/wikitext), configuration `wikitext-2-raw-v1` (the raw *train* split). The downloader saves its text to `data/wikitext.txt`, which is reused on subsequent runs. No word/subword tokenizer is used: `train.py` constructs the vocabulary from **individual Unicode characters**, and each character is one token. A fixed 90% / 10% character split preserves this project's existing validation procedure.
+
+To download separately:
+
+```bash
+pip install -r requirements.txt
+python prepare.py --dataset wikitext
+```
+
+Or simply start training; the rank-zero training process downloads missing data automatically, and other distributed workers wait for completion:
+
+```bash
+torchrun --standalone --nproc_per_node=2 train.py \
+  --dataset wikitext --target-kl 5.0 \
+  --steps 20000 --batch-size 16 --accumulation 4 \
+  --out checkpoints/wikitext
+```
+
+Use `--dataset shakespeare` for the original corpus (default), or `--data path/to/your.txt` to train on an existing UTF-8 file without downloading. WikiText uses a default prompt of `The ` rather than `ROMEO:\\n`, unless you explicitly pass `--prompt`. Changing the corpus or vocabulary is **not** checkpoint-compatible; use a new output directory and train from scratch. For a WikiText experiment, the actual words in a text sample are still just sequences of characters to the model.
+
 ## Run on two T4 GPUs
 
 Use Python 3.10+ and a CUDA-enabled PyTorch installation appropriate for your system:
