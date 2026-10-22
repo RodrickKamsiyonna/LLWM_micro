@@ -15,13 +15,15 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from llwm import ModelConfig, WorldModel
 from llwm.planning import plan
+from prepare import default_data_path, prepare_dataset
 
 LOSS_KEYS = ('loss', 'ce', 'kl', 'kl_total', 'kl_excess', 'kl_penalty', 'mse', 'eqm', 'eqm_penalty')
 
 
 def arguments():
     p = argparse.ArgumentParser(description='Character-level latent-action world model')
-    p.add_argument('--data', default='data/input.txt')
+    p.add_argument('--dataset', choices=['shakespeare', 'wikitext'], default='shakespeare', help='download/select a text corpus (default: shakespeare)')
+    p.add_argument('--data', default=None, help='custom local UTF-8 corpus; overrides --dataset download')
     p.add_argument('--out', default='checkpoints/token_action')
     p.add_argument('--resume')
     p.add_argument('--steps', type=int, default=20000)
@@ -124,7 +126,21 @@ def main():
     torch.manual_seed(args.seed + rank)
     random.seed(args.seed + rank)
     np.random.seed(args.seed + rank)
+    # Download once on rank zero. Other ranks wait until the file is complete.
+    if args.data is None:
+        if rank == 0:
+            data_path = prepare_dataset(args.dataset)
+            print(f'Dataset: {args.dataset} ({data_path})', flush=True)
+        if world > 1:
+            dist.barrier()
+        args.data = str(default_data_path(args.dataset))
     text = Path(args.data).read_text(encoding='utf-8')
+    if not text:
+        raise ValueError('dataset is empty')
+    if args.dataset == 'wikitext' and args.prompt == 'ROMEO:\\n':
+        args.prompt = 'The ' if set('The ').issubset(set(text)) else text[:1]
+    if args.dataset == 'wikitext' and args.goal == ' .' and not set(args.goal).issubset(set(text)):
+        args.goal = text[:1]
     chars = sorted(set(text))
     stoi = {ch: i for i, ch in enumerate(chars)}
     def encode(s):
