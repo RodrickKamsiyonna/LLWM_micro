@@ -82,7 +82,7 @@ class EQMTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(value['eqm']))
         with torch.autocast('cpu', dtype=torch.bfloat16):
             value = self.model(self.idx, self.targets, target_kl=1., eqm_weight=1., eqm_chunk_size=2)
-        value['loss'].backward()
+        (value['loss']+value['probe_ce']).backward()
         self.assertEqual(value['eqm'].dtype, torch.float32)
         for name, param in self.model.named_parameters():
             self.assertIsNotNone(param.grad, name)

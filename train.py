@@ -17,7 +17,7 @@ from llwm import ModelConfig, WorldModel
 from llwm.planning import plan
 from prepare import default_data_path, prepare_dataset
 
-LOSS_KEYS = ('loss', 'ce', 'kl', 'kl_total', 'kl_excess', 'kl_penalty', 'mse', 'eqm', 'eqm_penalty')
+LOSS_KEYS = ('loss', 'ce', 'kl', 'kl_total', 'kl_excess', 'kl_penalty', 'mse', 'eqm', 'eqm_penalty', 'probe_ce', 'probe_accuracy')
 
 
 def arguments():
@@ -108,6 +108,35 @@ def restore_rng(state):
         torch.cuda.set_rng_state(state['cuda'])
 
 
+def clip_training_gradients(model, max_norm=1.):
+    main_parameters = [p for name, p in model.named_parameters() if not name.startswith('memory_probe.')]
+    main_norm = torch.nn.utils.clip_grad_norm_(main_parameters, max_norm)
+    probe_norm = torch.nn.utils.clip_grad_norm_(model.memory_probe.parameters(), max_norm)
+    return main_norm, probe_norm
+
+
+def load_training_weights(model, optimizer, checkpoint):
+    """Allow pre-probe checkpoints, preserving every existing optimizer state."""
+    weights = dict(checkpoint['model'])
+    probe_keys = {f'memory_probe.{key}' for key in model.memory_probe.state_dict()}
+    fresh_probe = not probe_keys.intersection(weights)
+    if fresh_probe:
+        current = model.state_dict()
+        weights.update({key: current[key] for key in probe_keys})
+    model.load_state_dict(weights)  # All non-probe architecture mismatches remain errors.
+    saved = checkpoint['optimizer']
+    if fresh_probe:
+        groups = [dict(group, params=list(group['params'])) for group in saved['param_groups']]
+        current_groups = optimizer.state_dict()['param_groups']
+        if len(groups) != 1 or len(current_groups) != 1 or len(groups[0]['params'])+len(probe_keys) != len(current_groups[0]['params']):
+            raise ValueError('pre-probe optimizer layout differs from this model')
+        next_id = max(groups[0]['params'], default=-1)+1
+        groups[0]['params'].extend(range(next_id, next_id+len(probe_keys)))
+        saved = dict(saved, param_groups=groups)
+    optimizer.load_state_dict(saved)
+    return fresh_probe
+
+
 def main():
     args = arguments()
     loss_options = dict(target_kl=args.target_kl, kl_lambda=args.kl_lambda, ce_weight=args.ce_weight, mse_weight=args.mse_weight,
@@ -180,8 +209,9 @@ def main():
         import hashlib
         if ckpt['data_sha256'] != hashlib.sha256(text.encode()).hexdigest():
             raise ValueError('checkpoint dataset differs')
-        raw.load_state_dict(ckpt['model'])
-        optimizer.load_state_dict(ckpt['optimizer'])
+        fresh_probe = load_training_weights(raw, optimizer, ckpt)
+        if fresh_probe and rank == 0:
+            print('Initialized detached memory probe; restored existing model and optimizer states.', flush=True)
         scaler.load_state_dict(ckpt['scaler'])
         start, best_val, run_id = ckpt['step'], ckpt['best_val'], ckpt.get('wandb_id')
         if ckpt.get('loss_signature') != loss_signature:
@@ -263,14 +293,14 @@ def main():
             with sync:
                 with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=cuda):
                     values = model(*batch('train'), **train_loss_options)
-                if not torch.isfinite(values['loss']):
+                if not torch.isfinite(values['loss']) or not torch.isfinite(values['probe_ce']):
                     raise RuntimeError(f'nonfinite loss at step {step}')
-                scaler.scale(values['loss']/args.accumulation).backward()
+                scaler.scale((values['loss']+values['probe_ce'])/args.accumulation).backward()
             for k in totals:
                 totals[k] += values[k].detach()/args.accumulation
         scaler.unscale_(optimizer)
-        grad_norm = torch.nn.utils.clip_grad_norm_(raw.parameters(), 1.)
-        if not cuda and not torch.isfinite(grad_norm):
+        grad_norm, probe_grad_norm = clip_training_gradients(raw)
+        if not cuda and (not torch.isfinite(grad_norm) or not torch.isfinite(probe_grad_norm)):
             raise RuntimeError(f'nonfinite gradient at step {step}')
         old_scale = scaler.get_scale()
         scaler.step(optimizer)
@@ -282,7 +312,7 @@ def main():
                 print(f'AMP overflow: retrying optimizer step {step} at scale {scaler.get_scale()}', flush=True)
             continue
         metrics = {f'train/{k}': v for k, v in reduced(totals).items()}
-        metrics.update({'train/lr': lr, 'train/kl_lambda': effective_kl_lambda, 'train/grad_norm': float(grad_norm), 'train/amp_skipped_updates': skipped_updates, 'step': step})
+        metrics.update({'train/lr': lr, 'train/kl_lambda': effective_kl_lambda, 'train/grad_norm': float(grad_norm), 'train/probe_grad_norm': float(probe_grad_norm), 'train/amp_skipped_updates': skipped_updates, 'step': step})
         improved = False
         if step % args.eval_every == 0 or step == args.steps:
             # Evaluation/planning must not change subsequent training RNG streams.

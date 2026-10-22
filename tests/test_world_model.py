@@ -37,9 +37,12 @@ class WorldModelTests(unittest.TestCase):
             torch.distributions.Normal(torch.zeros_like(mean), torch.ones_like(mean))).mean()
         torch.testing.assert_close(values['ce'], expected_ce)
         torch.testing.assert_close(values['kl'], expected_kl)
-        self.assertEqual(set(values), {'loss', 'ce', 'kl', 'kl_total', 'kl_excess', 'kl_penalty', 'mse', 'eqm', 'eqm_penalty'})
+        self.assertEqual(set(values), {'loss', 'ce', 'kl', 'kl_total', 'kl_excess', 'kl_penalty', 'mse', 'eqm', 'eqm_penalty', 'probe_ce', 'probe_accuracy'})
         values['ce'].backward()
         for name, p in self.model.named_parameters():
+            if name.startswith('memory_probe.'):
+                self.assertIsNone(p.grad, name)
+                continue
             self.assertIsNotNone(p.grad, name)
             self.assertTrue(torch.isfinite(p.grad).all(), name)
             self.assertGreater(p.grad.abs().sum().item(), 0., name)
@@ -181,7 +184,7 @@ class WorldModelTests(unittest.TestCase):
     def test_autocast_preserves_attention_dtypes_and_budget_gradients(self):
         with torch.autocast(device_type='cpu', dtype=torch.bfloat16):
             values = self.model(self.idx, self.targets, target_kl=0., kl_lambda=0.1)
-        values['loss'].backward()
+        (values['loss']+values['probe_ce']).backward()
         for name, p in self.model.named_parameters():
             self.assertIsNotNone(p.grad, name)
             self.assertTrue(torch.isfinite(p.grad).all(), name)

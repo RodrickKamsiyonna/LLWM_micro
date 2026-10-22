@@ -95,6 +95,9 @@ class WorldModel(nn.Module):
         self.predictor = nn.ModuleList([AdaptiveBlock(c) for _ in range(c.predictor_layers)])
         self.predictor_norm = nn.LayerNorm(c.width)
         self.head = nn.Linear(c.width, c.vocab_size)
+        # A diagnostic readout must not change the existing model's RNG stream.
+        with torch.random.fork_rng(devices=[]):
+            self.memory_probe = nn.Linear(c.width, c.vocab_size)
 
     def encode(self, idx=None, *, embeddings=None, kv_cache=None):
         """Encode IDs OR differentiable embeddings; return memories and bounded KV cache."""
@@ -166,6 +169,13 @@ class WorldModel(nn.Module):
         per_token_mse = (predicted_memory.float()-next_memory.float()).square().mean(-1)
         mse = (per_token_mse*valid).sum()/count
         ce = F.cross_entropy(logits.flatten(0, 1), targets.flatten(), ignore_index=-1, reduction='sum') / count
+        # This probe measures next-character information in the compressor memory.
+        # Its input is detached, and its objective is kept separate from model loss.
+        probe_logits = self.memory_probe(h.detach()).float()
+        probe_logits = 15 * torch.tanh(probe_logits/15)
+        probe_ce = F.cross_entropy(probe_logits.flatten(0, 1), targets.flatten(),
+                                   ignore_index=-1, reduction='sum') / count
+        probe_accuracy = (probe_logits.argmax(-1).eq(targets) & valid).sum().float()/count
         # Mean over valid tokens AND action dimensions, matching the supplied VAE KL.
         per_dim_kl = 0.5*(mean.float().square() + (2*log_std.float()).exp() - 1 - 2*log_std.float())
         kl = (per_dim_kl*valid[..., None]).sum()/(count*self.config.action_dim)
@@ -178,5 +188,6 @@ class WorldModel(nn.Module):
                if eqm_weight else logits.new_zeros(()))
         eqm_penalty = eqm_weight*eqm
         return {'loss': ce_weight*ce + kl_penalty + mse_weight*mse + eqm_penalty,
+                'probe_ce': probe_ce, 'probe_accuracy': probe_accuracy,
                 'eqm': eqm, 'eqm_penalty': eqm_penalty, 'ce': ce, 'mse': mse, 'kl': kl,
                 'kl_total': kl_total, 'kl_excess': kl_excess, 'kl_penalty': kl_penalty}

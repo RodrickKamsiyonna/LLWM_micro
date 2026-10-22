@@ -18,6 +18,23 @@ loss = ce_weight * CE(logits, next_tokens) + kl_lambda * excess**2 + mse_weight 
 
 CE trains the compressor, action encoder, predictor, and head. The previously requested stop-gradients remain at both action-encoder inputs; CE reaches the compressor through the direct predictor input. The head and predictor output are **not detached**. There is no separate compressor-head CE. MSE trains the predictor, action encoder, and current-memory compressor path; its next-memory target is detached. `--mse-weight` defaults to 1 and must be finite and nonnegative. W&B logs the unweighted MSE as `train/mse` and `val/mse`.
 
+## Detached memory probe
+
+A separate linear vocabulary head measures next-character information in the compressor's **current memory**, without updating that memory:
+
+```python
+probe_logits = memory_probe(memory.detach())   # m[t] -> x[t+1]
+probe_ce = cross_entropy(capped(probe_logits), next_tokens, ignore_index=-1)
+```
+
+The existing predictor head and all original model objectives are preserved. This probe is an independent diagnostic readout, with its own parameters; it is not used by the action encoder, predictor, EQM, or planner. Probe initialization preserves the existing model's RNG stream.
+
+Only `memory_probe` receives gradients from `probe_ce`. The trainer backpropagates `model_loss + probe_ce`, but logs `loss` and selects best checkpoints using the original model objective alone. The returned `WorldModel.forward()['loss']` excludes the diagnostic probe; callers training the probe should add `probe_ce` as the trainer does. Probe and main-model gradients are clipped independently, so a large probe gradient cannot change the main model's clipping coefficient. Both use AdamW and the existing learning-rate schedule.
+
+W&B logs **`train/probe_ce`**, **`train/probe_accuracy`**, **`val/probe_ce`**, and **`val/probe_accuracy`**. Accuracy is the fraction of valid next characters predicted correctly. Ignored target positions do not contribute; entirely ignored batches return zero. Logits use the same smooth cap as the original head. Lower validation probe CE and higher validation accuracy indicate more next-character information accessible to this linear readout; they do not measure all information in the memory.
+
+New checkpoints save the probe weights and optimizer moments. Resuming a pre-probe checkpoint restores existing model weights, optimizer moments, scaler and RNG streams, while initializing only the new diagnostic head and its fresh optimizer state. Partial or unrelated architecture mismatches remain errors. Existing best-validation scores remain comparable because the diagnostic loss is excluded from that score.
+
 ## KL budget
 
 `kl` is the mean Gaussian KL over valid tokens and action dimensions. Therefore **`kl_total = kl * action_dim` is the mean total latent KL per valid token**, measured in nats. It is not the sum across the whole minibatch. To get that sum, multiply by the number of valid tokens as well.
@@ -166,8 +183,8 @@ The new default output directory is `checkpoints/token_action`, preserving older
 python -m unittest discover -s tests -v
 ```
 
-Tests cover next-token CE and per-dimension KL, analytical KL totals and budget gradients, coefficient ramp endpoints, ignored targets, all-module CE gradients, detached action-encoder inputs, full-versus-cached sliding attention, next-memory target alignment and stop-gradients, and autoregressive memory-rollout/action gradients. Planning tests assert that the compressor is called exactly once and goal tokens never enter the model. CPU mixed-precision gradients are checked as well.
+Tests cover next-token CE and per-dimension KL, analytical KL totals and budget gradients, coefficient ramp endpoints, ignored targets, main-model CE gradients and detached-probe isolation, detached action-encoder inputs, full-versus-cached sliding attention, next-memory target alignment and stop-gradients, and autoregressive memory-rollout/action gradients. Planning tests assert that the compressor is called exactly once and goal tokens never enter the model. CPU mixed-precision gradients are checked as well.
 
-All 35 tests passed. EQM regression tests include exact loss/parameter-gradient comparisons against a direct second-order reference at chunk sizes 1, 3, and full batch, attached compressor-memory gradients, detached sampled actions, skipped disabled computation, validation, CPU mixed precision, outer gradient scaling, saved-tensor-hook compatibility, and peak saved-storage reduction. Tests also cover memory-pair inference and inverse-consistency planning. A two-process CPU/Gloo smoke run completed training with gradient accumulation, validation, planning and checkpoint saving using the restored custom backward. Actual T4 execution and resolution of the reported GPU training OOM remain unverified locally.
+All 41 tests passed, including detached-probe gradient isolation, independent gradient clipping, ignored targets, old/new checkpoint restoration, and exclusion of the probe from planning. EQM regression tests retain exact loss/parameter-gradient comparisons, outer gradient scaling and saved-memory checks. A two-process CPU/Gloo smoke run completed training with gradient accumulation and chunked EQM, validation, planning and checkpoint saving. Its main-model weights, AdamW moments and best validation score exactly matched the archived run without the probe. Offline W&B recorded probe CE and accuracy for train and validation. Actual T4 execution and resolution of the reported GPU training OOM remain unverified locally.
 
 Local verification uses PyTorch 2.2.2/NumPy 1.26.4/W&B 0.18.7 on an Intel Mac. The GPU requirements target PyTorch 2.4+. Actual T4 FP16/NCCL performance and peak GPU memory remain unverified locally.
