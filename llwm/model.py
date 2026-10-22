@@ -78,6 +78,27 @@ class AdaptiveBlock(nn.Module):
         return memory + self.net(self.norm(memory)*(1+scale) + shift)
 
 
+class ActionEncoder(nn.Module):
+    """Halve concatenated memory width down to an action-dimensional bottleneck."""
+    def __init__(self, width, action_dim):
+        super().__init__()
+        if action_dim < 1 or action_dim > 2*width:
+            raise ValueError('action_dim must be positive and no larger than 2*width')
+        layers = []
+        current = 2*width
+        while current > action_dim:
+            following = max(action_dim, current//2)
+            layers.extend((nn.Linear(current, following), nn.GELU()))
+            current = following
+        self.trunk = nn.Sequential(*layers)
+        self.mean = nn.Linear(action_dim, action_dim)
+        self.log_std = nn.Linear(action_dim, action_dim)
+
+    def forward(self, inputs):
+        hidden = self.trunk(inputs)
+        return torch.cat((self.mean(hidden), self.log_std(hidden)), dim=-1)
+
+
 class WorldModel(nn.Module):
     def __init__(self, c):
         super().__init__()
@@ -91,7 +112,7 @@ class WorldModel(nn.Module):
         self.compressor_norm = nn.LayerNorm(c.width)
         freq = 1 / (c.rope_base ** (torch.arange(0, c.width//c.heads, 2).float()/(c.width//c.heads)))
         self.register_buffer('rope_frequency', freq, persistent=False)
-        self.action_encoder = nn.Sequential(nn.Linear(2*c.width, 2*c.width), nn.GELU(), nn.Linear(2*c.width, 2*c.action_dim))
+        self.action_encoder = ActionEncoder(c.width, c.action_dim)
         self.predictor = nn.ModuleList([AdaptiveBlock(c) for _ in range(c.predictor_layers)])
         self.predictor_norm = nn.LayerNorm(c.width)
         self.head = nn.Linear(c.width, c.vocab_size)

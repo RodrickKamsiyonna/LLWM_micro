@@ -118,6 +118,11 @@ def clip_training_gradients(model, max_norm=1.):
 def load_training_weights(model, optimizer, checkpoint):
     """Allow pre-probe checkpoints, preserving every existing optimizer state."""
     weights = dict(checkpoint['model'])
+    current_weights = model.state_dict()
+    action_keys = {key for key in current_weights if key.startswith('action_encoder.')}
+    saved_action_keys = {key for key in weights if key.startswith('action_encoder.')}
+    if action_keys != saved_action_keys or any(weights[key].shape != current_weights[key].shape for key in action_keys):
+        raise ValueError('checkpoint action encoder differs from the halving-width architecture; start a new run')
     probe_keys = {f'memory_probe.{key}' for key in model.memory_probe.state_dict()}
     fresh_probe = not probe_keys.intersection(weights)
     if fresh_probe:
