@@ -1,3 +1,4 @@
 torch>=2.4,<3
 numpy>=1.26
 wandb>=0.18
+datasets>=2.19,<5
