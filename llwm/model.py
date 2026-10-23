@@ -147,9 +147,10 @@ class WorldModel(nn.Module):
         return mean, log_std.clamp(-5, 2)
 
     def predict_features(self, memory, action):
+        current_memory = memory
         for block in self.predictor:
             memory = block(memory, action)
-        return self.predictor_norm(memory)
+        return current_memory + self.predictor_norm(memory)
 
     def predict_logits(self, memory, action):
         return self.decode_memory(self.predict_features(memory, action))
@@ -187,8 +188,9 @@ class WorldModel(nn.Module):
         logits = self.decode_memory(predicted_memory)
         valid = targets.ne(-1)
         count = valid.sum().clamp(min=1)
-        per_token_mse = (predicted_memory.float()-next_memory.float()).square().mean(-1)
-        mse = (per_token_mse*valid).sum()/count
+        per_token_memory_loss = F.smooth_l1_loss(predicted_memory.float(), next_memory.float(),
+                                                beta=1., reduction='none').mean(-1)
+        smooth_l1 = (per_token_memory_loss*valid).sum()/count
         ce = F.cross_entropy(logits.flatten(0, 1), targets.flatten(), ignore_index=-1, reduction='sum') / count
         # This probe measures next-character information in the compressor memory.
         # Its input is detached, and its objective is kept separate from model loss.
@@ -208,7 +210,7 @@ class WorldModel(nn.Module):
                                          chunk_size=eqm_chunk_size)
                if eqm_weight else logits.new_zeros(()))
         eqm_penalty = eqm_weight*eqm
-        return {'loss': ce_weight*ce + kl_penalty + mse_weight*mse + eqm_penalty,
+        return {'loss': ce_weight*ce + kl_penalty + mse_weight*smooth_l1 + eqm_penalty,
                 'probe_ce': probe_ce, 'probe_accuracy': probe_accuracy,
-                'eqm': eqm, 'eqm_penalty': eqm_penalty, 'ce': ce, 'mse': mse, 'kl': kl,
+                'eqm': eqm, 'eqm_penalty': eqm_penalty, 'ce': ce, 'smooth_l1': smooth_l1, 'kl': kl,
                 'kl_total': kl_total, 'kl_excess': kl_excess, 'kl_penalty': kl_penalty}

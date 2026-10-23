@@ -17,7 +17,7 @@ from llwm import ModelConfig, WorldModel
 from llwm.planning import plan
 from prepare import default_data_path, prepare_dataset
 
-LOSS_KEYS = ('loss', 'ce', 'kl', 'kl_total', 'kl_excess', 'kl_penalty', 'mse', 'eqm', 'eqm_penalty', 'probe_ce', 'probe_accuracy')
+LOSS_KEYS = ('loss', 'ce', 'kl', 'kl_total', 'kl_excess', 'kl_penalty', 'smooth_l1', 'eqm', 'eqm_penalty', 'probe_ce', 'probe_accuracy')
 
 
 def arguments():
@@ -42,7 +42,7 @@ def arguments():
     p.add_argument('--kl-lambda', type=float, default=1., help='coefficient of squared KL excess above the target')
     p.add_argument('--kl-steps', type=int, default=0, help='linear coefficient warmup in optimizer updates; 0 disables, 1 reaches full strength immediately')
     p.add_argument('--ce-weight', type=float, default=1.)
-    p.add_argument('--mse-weight', type=float, default=1., help='next-memory MSE coefficient')
+    p.add_argument('--mse-weight', type=float, default=1., help='next-memory Smooth L1 coefficient (legacy option name)')
     p.add_argument('--eqm-weight', type=float, default=0., help='EQM loss coefficient; 0 skips computation')
     p.add_argument('--eqm-lambda', type=float, default=1., help='target action-gradient field scale')
     p.add_argument('--eqm-chunk-size', type=int, default=128, help='valid transitions per recomputed EQM chunk; 0 uses all')
@@ -203,7 +203,7 @@ def main():
     scaler = (torch.amp.GradScaler('cuda', enabled=cuda) if hasattr(torch.amp, 'GradScaler')
               else torch.cuda.amp.GradScaler(enabled=cuda))
     start, best_val, run_id = 0, float('inf'), None
-    loss_signature = {'objective': 'memory_pair_action_eqm_v5', 'ce': args.ce_weight, 'mse': args.mse_weight,
+    loss_signature = {'objective': 'memory_pair_residual_action_smooth_l1_v7', 'ce': args.ce_weight, 'smooth_l1': args.mse_weight,
                       'eqm_weight': args.eqm_weight, 'eqm_lambda': args.eqm_lambda,
                       'target_kl': args.target_kl, 'kl_lambda': args.kl_lambda, 'kl_steps': args.kl_steps}
     if args.resume:

@@ -57,7 +57,7 @@ class EQMTests(unittest.TestCase):
     def test_forward_eqm_updates_memory_predictor_head_but_not_action_encoder(self):
         values = self.model(self.idx, self.targets, target_kl=1., eqm_weight=0.3, eqm_chunk_size=3)
         torch.testing.assert_close(values['eqm_penalty'], 0.3*values['eqm'])
-        torch.testing.assert_close(values['loss'], values['ce']+values['mse']+values['kl_penalty']+values['eqm_penalty'])
+        torch.testing.assert_close(values['loss'], values['ce']+values['smooth_l1']+values['kl_penalty']+values['eqm_penalty'])
         values['eqm'].backward()
         for module in [self.model.compressor, self.model.predictor, self.model.head]:
             self.assertTrue(any(p.grad is not None and p.grad.abs().sum()>0 for p in module.parameters()))
