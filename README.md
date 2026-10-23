@@ -1,6 +1,6 @@
 # Character-level latent-action language model
 
-The compressor encodes text into causal memories. A Gaussian action encoder sees the current memory and **next compressor memory**. An action-conditioned predictor and vocabulary head reconstruct that next token. The predictor predicts a memory delta; adding the current memory gives the next-memory prediction, supervised by a detached next-memory MSE target.
+The compressor encodes text into causal memories. A Gaussian action encoder sees the current memory and **next compressor memory**. An action-conditioned predictor and vocabulary head reconstruct that next token. The predictor directly predicts the next memory, supervised against a detached compressor-memory target using a selectable regression loss.
 
 ## Training
 
@@ -8,17 +8,19 @@ The compressor encodes text into causal memories. A Gaussian action encoder sees
 h = compressor(input_tokens)
 mu, log_std = action_encoder(detach(h), detach(next_memory))
 action = mu + exp(log_std) * Normal(0, I)
-features = h + predictor_delta(h, action)  # predicted next memory; adaptive LayerNorm conditioning
+features = predictor(h, action)  # predicted next memory; adaptive LayerNorm conditioning
 logits = 15 * tanh(head(features) / 15)
 kl = mean_valid_tokens_and_dimensions(KL(q(action) || Normal(0, I)))
 kl_total = kl * action_dim
 excess = relu(kl_total - target_kl)
-loss = ce_weight * CE(logits, next_tokens) + kl_lambda * excess**2 + mse_weight * MSE(features, detach(next_memory))
+loss = ce_weight * CE(logits, next_tokens) + kl_lambda * excess**2 + mse_weight * memory_loss(features, detach(next_memory))
 ```
 
-CE trains the compressor, action encoder, predictor, and head. The previously requested stop-gradients remain at both action-encoder inputs; CE reaches the compressor through the direct predictor input. The head and predictor output are **not detached**. There is no separate compressor-head CE. MSE trains the predictor, action encoder, and current-memory compressor path; its next-memory target is detached. `--mse-weight` weights MSE (default 1) and must be finite and nonnegative. MSE averages memory dimensions and valid transitions, and keeps next-memory targets detached. Planning inverse-dynamics consistency remains MSE. W&B logs the unweighted loss as `train/mse` and `val/mse`.
+CE trains the compressor, action encoder, predictor, and head. Both action-encoder inputs remain detached during training; CE reaches the compressor through the direct predictor input. The head and predictor output are not detached. There is no separate compressor-head CE.
 
-The next-memory prediction is `current_memory + predictor_delta(current_memory, action)`. The whole-predictor skip is added **after** the final predictor LayerNorm; the existing per-block residuals remain. Training CE, memory MSE, EQM, and planning all use this same residual prediction. The skip path stays attached during training. The changed loss signature resets best validation loss when resuming; same-shape weights remain loadable, but predictions change under the new residual rule.
+Select the next-memory regression loss with **`--memory-loss smooth_l1`** (default, beta=1) or **`--memory-loss mse`**. The existing `--mse-weight` controls either selected loss (default 1). Both losses average memory dimensions and valid transitions, keep next-memory targets detached, and update the predictor, action encoder and current-memory compressor path. W&B logs the selected regression loss consistently as `train/memory_loss` and `val/memory_loss`. Planning inverse-dynamics consistency remains MSE.
+
+The whole-predictor skip is removed: the next memory is the predictor's normalized output, without adding current memory afterward. Existing per-block residuals remain. Training, EQM and planning all use that same prediction function. The memory-loss choice is saved in checkpoints; changing it or moving from the outer-residual formulation resets best validation loss. Same-shape weights remain loadable, but predictions change when removing the outer skip.
 
 ## Detached memory probe
 
@@ -45,7 +47,7 @@ The required `--target-kl` sets the budget; there is deliberately no default tar
 
 ```python
 excess = F.relu(kl_total - target_kl)
-loss = ce_weight * ce + kl_lambda * excess.square() + mse_weight * mse
+loss = ce_weight * ce + kl_lambda * excess.square() + mse_weight * memory_loss
 ```
 
 This is a one-sided upper-budget penalty: below or at the target it is zero, so it does not push KL up toward the target. Above it, the penalty grows quadratically. Setting `--kl-lambda 0` disables the penalty while retaining raw KL diagnostics. Target and coefficient must be finite and nonnegative.
@@ -64,7 +66,7 @@ W&B logs the effective coefficient as `train/kl_lambda`. Training `kl_penalty` u
 
 The budget applies to the mean valid-token KL of each forward microbatch. DDP and gradient accumulation average those microbatch objectives. Since the penalty is nonlinear, the average of local penalties need not equal a penalty recomputed from the globally averaged logged KL. This implementation follows the formula on each forward call.
 
-CE, KL, and MSE ignore target index `-1`; an entirely ignored batch returns finite zero losses. Ignored targets do not consume the KL budget. The final target token clamps ignored indices to zero for the extra memory-target encoding. Training uses FP16 autocast/gradient scaling on CUDA and FP32 on CPU. CE computation and its gradient paths are unchanged.
+CE, KL, and memory regression ignore target index `-1`; an entirely ignored batch returns finite zero losses. Ignored targets do not consume the KL budget. The final target token clamps ignored indices to zero for the extra memory-target encoding. Training uses FP16 autocast/gradient scaling on CUDA and FP32 on CPU. CE computation and its gradient paths are unchanged.
 
 ## Optional equilibrium matching (EQM)
 
@@ -80,7 +82,7 @@ energy = CE(head(predictor(memory, noisy_action)), next_token, reduction='sum')
 grad_energy = autograd.grad(energy, noisy_action, create_graph=True)[0]
 target_gradient = (eps - action.detach()) * eqm_lambda * (1 - gamma)
 eqm = mean((grad_energy - target_gradient)**2)
-loss = ce_weight * ce + mse_weight * mse + kl_penalty + eqm_weight * eqm
+loss = ce_weight * ce + mse_weight * memory_loss + kl_penalty + eqm_weight * eqm
 ```
 
 The noisy action is a fresh detached gradient input: EQM does not train the action encoder through either the interpolation or target field. **Memory is not detached.** EQM trains the compressor through memory, plus the predictor and LLM head. This additional training objective leaves memory-space planning and its inverse-dynamics consistency regularizer unchanged.
@@ -89,7 +91,7 @@ The noisy action is a fresh detached gradient input: EQM does not train the acti
 
 EQM restores the custom-autograd recomputation strategy from commit `327fe65`. Forward computes only the first action derivative and releases each chunk graph. Backward rebuilds one chunk with `create_graph=True`, computes its parameter and memory gradients, accumulates those tensors, and releases the graph before constructing the next chunk. It does not use the checkpoint-based implementation introduced in `b7b76be`.
 
-Local memory leaves inside custom backward isolate recomputation; their gradients are explicitly returned to the original attached compressor memory. This preserves compressor gradients while the noisy action and target action stay detached. AMP's outer loss scale is applied only after differentiating the chunk, never to the inner CE field. Smaller chunks reduce per-chunk activation storage but add overhead. The shared compressor and ordinary CE/MSE graphs still consume memory. Validation computes first action derivatives without keeping a parameter-update graph.
+Local memory leaves inside custom backward isolate recomputation; their gradients are explicitly returned to the original attached compressor memory. This preserves compressor gradients while the noisy action and target action stay detached. AMP's outer loss scale is applied only after differentiating the chunk, never to the inner CE field. Smaller chunks reduce per-chunk activation storage but add overhead. The shared compressor and ordinary CE/memory-loss graphs still consume memory. Validation computes first action derivatives without keeping a parameter-update graph.
 
 In an isolated CPU benchmark (256 transitions, width 64, three predictor layers, action dimension 16, chunks of 32), full EQM and recomputation both returned loss 0.6695118. Peak unique storage retained by autograd saves fell from 5,857,028 to 1,211,528 bytes (about 4.8x lower); time rose from about 44 to 132 ms. This saved-storage proxy is not process RSS or CUDA allocator memory. Measure actual T4 peaks with:
 
@@ -136,7 +138,7 @@ torchrun --standalone --nproc_per_node=2 train.py \
   --steps 20000 --context 256 --batch-size 16 --accumulation 4 \
   --width 256 --heads 4 --compressor-layers 4 --predictor-layers 3 \
   --action-dim 32 --lr 3e-4 --warmup 200 \
-  --ce-weight 1 --mse-weight 1 --target-kl 5.0 --kl-lambda 1 --kl-steps 1000 \
+  --ce-weight 1 --memory-loss smooth_l1 --mse-weight 1 --target-kl 5.0 --kl-lambda 1 --kl-steps 1000 \
   --plan-horizon 500 --plan-iterations 100 --plan-lr 0.05 --plan-consistency-weight 1 \
   --goal ' .' --run-name token-action
 ```
@@ -165,15 +167,15 @@ planning_loss = CE(logits[-len(goal):], goal) + consistency_weight * consistency
 
 Each predicted memory is the input to the next transition. The same LLM head used during training decodes the token added by each transition. A 500-token plan has 500 actions and 500 memory transitions; the last predicted memory decodes the 500th token. There are no soft-token embeddings, compressor feedback calls, or KV-cache updates during rollout. The prompt is truncated to its final context-length tokens.
 
-Goal characters are targets only: they are never fed into the predictor or action encoder. The goal can be multiple characters or lines and must fit in the horizon and vocabulary. Planning combines goal-suffix CE with inverse-dynamics consistency: each optimized action is compared by MSE to the action encoder's Gaussian mean for its own predicted `(current_memory, next_memory)` pair. The action vectors are not averaged across trajectories, and no action is sampled for this penalty. MSE averages the squared elementwise differences across batch, horizon, and action dimensions. `--plan-consistency-weight` defaults to 1; 0 disables the penalty and skips the inverse encoder computation. Inverse consistency is a planning-only regularizer; training uses CE, memory MSE, the KL budget, and optional EQM. It encourages consistency with learned transitions, without guaranteeing valid trajectories. All model parameters are frozen and restored afterward; gradients traverse the complete memory trajectory and both inverse-encoder memory inputs to optimize only the actions. The inverse encoder inputs are detached only during training, not during planning.
+Goal characters are targets only: they are never fed into the predictor or action encoder. The goal can be multiple characters or lines and must fit in the horizon and vocabulary. Planning combines goal-suffix CE with inverse-dynamics consistency: each optimized action is compared by MSE to the action encoder's Gaussian mean for its own predicted `(current_memory, next_memory)` pair. The action vectors are not averaged across trajectories, and no action is sampled for this penalty. MSE averages the squared elementwise differences across batch, horizon, and action dimensions. `--plan-consistency-weight` defaults to 1; 0 disables the penalty and skips the inverse encoder computation. Inverse consistency is a planning-only regularizer; training uses CE, memory regression, the KL budget, and optional EQM. It encourages consistency with learned transitions, without guaranteeing valid trajectories. All model parameters are frozen and restored afterward; gradients traverse the complete memory trajectory and both inverse-encoder memory inputs to optimize only the actions. The inverse encoder inputs are detached only during training, not during planning.
 
-Planning uses Adam for 100 iterations at learning rate 0.05 by default. The initialized candidate and final update are included when selecting the best combined planning objective. The reported goal CE remains separate from that combined loss. After optimization, the best memory trajectory is decoded with the LLM head using argmax. Exact match checks that decoded suffix; the goal is never appended to the output. Low goal loss does not guarantee an exact match or coherent intermediate text. Long memory rollouts can accumulate prediction error; one-step MSE does not guarantee long-horizon accuracy. The obsolete `--plan-temperature` option has been removed because no soft-token feedback is used.
+Planning uses Adam for 100 iterations at learning rate 0.05 by default. The initialized candidate and final update are included when selecting the best combined planning objective. The reported goal CE remains separate from that combined loss. After optimization, the best memory trajectory is decoded with the LLM head using argmax. Exact match checks that decoded suffix; the goal is never appended to the output. Low goal loss does not guarantee an exact match or coherent intermediate text. Long memory rollouts can accumulate prediction error; one-step memory regression does not guarantee long-horizon accuracy. The obsolete `--plan-temperature` option has been removed because no soft-token feedback is used.
 
 Training expects contiguous shifted windows (`idx=x[:-1]`, `targets=x[1:]`). Next-memory targets reuse the shifted compressor output and encode the final target once with the training prefix cache, covering all positions without a second full compressor pass. Targets are detached, while the current-memory path stays differentiable. KV caching remains available for compressor encoding but is unnecessary during memory-space planning.
 
 ## Logging, checkpoints, and compatibility
 
-W&B is online by default (`wandb login`). `--wandb-mode offline` saves locally; `disabled` turns logging off. Rank zero logs `loss`, `ce`, per-dimension `kl`, `kl_total`, `kl_excess`, weighted `kl_penalty`, and next-memory `mse` under both `train/` and `val/`, plus learning rate, gradient norm, and planning text/history. Planning logs `plan/inverse_consistency` (raw MSE), `plan/consistency_penalty` (weighted MSE), `plan/goal_ce`, and `plan/best_loss` (their sum for the selected trajectory). Optimization history and planning JSON include both components. The weighted penalty is exactly `kl_lambda * kl_excess**2`, the KL contribution added to total loss. `--project` and `--run-name` customize the run.
+W&B is online by default (`wandb login`). `--wandb-mode offline` saves locally; `disabled` turns logging off. Rank zero logs `loss`, `ce`, per-dimension `kl`, `kl_total`, `kl_excess`, weighted `kl_penalty`, and selected next-memory `memory_loss` under both `train/` and `val/`, plus learning rate, gradient norm, and planning text/history. Planning logs `plan/inverse_consistency` (raw MSE), `plan/consistency_penalty` (weighted MSE), `plan/goal_ce`, and `plan/best_loss` (their sum for the selected trajectory). Optimization history and planning JSON include both components. The weighted penalty is exactly `kl_lambda * kl_excess**2`, the KL contribution added to total loss. `--project` and `--run-name` customize the run.
 
 The new default output directory is `checkpoints/token_action`, preserving older experiment artifacts. Numbered checkpoints retain model/optimizer/scaler, configuration, vocabulary, dataset hash, step, best validation loss, W&B ID, and per-rank Python/NumPy/Torch/CUDA RNG state. `latest.pt` and `best.pt` point to relevant files. Planning results are also written as `plan_STEP.json`.
 
@@ -187,6 +189,6 @@ python -m unittest discover -s tests -v
 
 Tests cover next-token CE and per-dimension KL, analytical KL totals and budget gradients, coefficient ramp endpoints, ignored targets, main-model CE gradients and detached-probe isolation, detached action-encoder inputs, full-versus-cached sliding attention, next-memory target alignment and stop-gradients, and autoregressive memory-rollout/action gradients. Planning tests assert that the compressor is called exactly once and goal tokens never enter the model. CPU mixed-precision gradients are checked as well.
 
-All 46 tests passed, including MSE value/gradient checks, the attached whole-predictor skip, default/non-power-of-two encoder halving, Gaussian head outputs, rejection of incompatible old encoder checkpoints, detached-probe gradient isolation, independent gradient clipping, ignored targets, old/new checkpoint restoration, and exclusion of the probe from planning. EQM regression tests retain exact loss/parameter-gradient comparisons, outer gradient scaling and saved-memory checks. Before the action-encoder architecture change, a two-process CPU/Gloo smoke run completed training with gradient accumulation and chunked EQM, validation, planning and checkpoint saving. Its main-model weights, AdamW moments and best validation score exactly matched the archived run without the probe. Offline W&B recorded probe CE and accuracy for train and validation. Actual T4 execution and resolution of the reported GPU training OOM remain unverified locally.
+All 49 tests passed, covering both memory-loss choices, masked values/gradients, and the absence of a whole-predictor skip, alongside default/non-power-of-two encoder halving, Gaussian head outputs, rejection of incompatible old encoder checkpoints, detached-probe gradient isolation, independent gradient clipping, ignored targets, old/new checkpoint restoration, and exclusion of the probe from planning. EQM regression tests retain exact loss/parameter-gradient comparisons, outer gradient scaling and saved-memory checks. Before the action-encoder architecture change, a two-process CPU/Gloo smoke run completed training with gradient accumulation and chunked EQM, validation, planning and checkpoint saving. Its main-model weights, AdamW moments and best validation score exactly matched the archived run without the probe. Offline W&B recorded probe CE and accuracy for train and validation. Actual T4 execution and resolution of the reported GPU training OOM remain unverified locally.
 
 Local verification uses PyTorch 2.2.2/NumPy 1.26.4/W&B 0.18.7 on an Intel Mac. The GPU requirements target PyTorch 2.4+. Actual T4 FP16/NCCL performance and peak GPU memory remain unverified locally.

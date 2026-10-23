@@ -20,20 +20,20 @@ class WorldModelTests(unittest.TestCase):
         expected, _ = self.model.encode(self.idx)
         torch.testing.assert_close(actual[:, :2], expected[:, :2])
 
-    def test_predictor_adds_current_memory_after_final_norm_with_attached_skip(self):
+    def test_predictor_has_no_whole_module_residual(self):
         memory = torch.randn(2, 4, 16, requires_grad=True)
         action = torch.randn(2, 4, 4, requires_grad=True)
-        # A constant delta isolates the outer skip from internal block residuals.
+        # A constant final readout must not have the input memory added back.
         with torch.no_grad():
             self.model.predictor_norm.weight.zero_()
             self.model.predictor_norm.bias.fill_(0.25)
         predicted = self.model.predict_features(memory, action)
-        torch.testing.assert_close(predicted, memory+0.25)
+        torch.testing.assert_close(predicted, torch.full_like(memory, 0.25))
         gradient, = torch.autograd.grad(predicted.sum(), memory)
-        torch.testing.assert_close(gradient, torch.ones_like(memory))
+        torch.testing.assert_close(gradient, torch.zeros_like(memory))
         with torch.no_grad():
             self.model.predictor_norm.bias.zero_()
-        torch.testing.assert_close(self.model.predict_features(memory, action), memory)
+        torch.testing.assert_close(self.model.predict_features(memory, action), torch.zeros_like(memory))
 
     def test_ce_kl_alignment_and_all_training_gradients(self):
         state = torch.get_rng_state()
@@ -52,7 +52,7 @@ class WorldModelTests(unittest.TestCase):
             torch.distributions.Normal(torch.zeros_like(mean), torch.ones_like(mean))).mean()
         torch.testing.assert_close(values['ce'], expected_ce)
         torch.testing.assert_close(values['kl'], expected_kl)
-        self.assertEqual(set(values), {'loss', 'ce', 'kl', 'kl_total', 'kl_excess', 'kl_penalty', 'mse', 'eqm', 'eqm_penalty', 'probe_ce', 'probe_accuracy'})
+        self.assertEqual(set(values), {'loss', 'ce', 'kl', 'kl_total', 'kl_excess', 'kl_penalty', 'memory_loss', 'eqm', 'eqm_penalty', 'probe_ce', 'probe_accuracy'})
         values['ce'].backward()
         for name, p in self.model.named_parameters():
             if name.startswith('memory_probe.'):
@@ -87,7 +87,7 @@ class WorldModelTests(unittest.TestCase):
         targets = self.targets.clone()
         targets[:, -1] = -1
         values = self.model(self.idx, targets, ce_weight=0.3, target_kl=0., kl_lambda=0.2)
-        torch.testing.assert_close(values['loss'], 0.3*values['ce']+0.2*values['kl_total'].square()+values['mse'])
+        torch.testing.assert_close(values['loss'], 0.3*values['ce']+0.2*values['kl_total'].square()+values['memory_loss'])
         ignored = self.model(self.idx, torch.full_like(targets, -1), target_kl=1.)
         self.assertEqual(ignored['loss'].item(), 0.)
         ignored['loss'].backward()
@@ -145,14 +145,14 @@ class WorldModelTests(unittest.TestCase):
             predicted.append(result)
             return result
         self.model.predict_features = predict
-        values = self.model(idx, targets, target_kl=1., mse_weight=0.7)
+        values = self.model(idx, targets, target_kl=1., mse_weight=0.7, memory_loss='mse')
         with torch.no_grad():
             expected, _ = self.model.encode(tokens)
-        torch.testing.assert_close(values['mse'], F.mse_loss(predicted[0], expected[:, 1:]))
-        gradient, = torch.autograd.grad(values['mse'], predicted[0], retain_graph=True)
+        torch.testing.assert_close(values['memory_loss'], F.mse_loss(predicted[0], expected[:, 1:]))
+        gradient, = torch.autograd.grad(values['memory_loss'], predicted[0], retain_graph=True)
         torch.testing.assert_close(gradient, 2*(predicted[0]-expected[:, 1:])/predicted[0].numel())
-        torch.testing.assert_close(values['loss'], values['ce']+values['kl_penalty']+0.7*values['mse'])
-        values['mse'].backward()
+        torch.testing.assert_close(values['loss'], values['ce']+values['kl_penalty']+0.7*values['memory_loss'])
+        values['memory_loss'].backward()
         for module in [self.model.compressor, self.model.predictor, self.model.action_encoder]:
             self.assertTrue(any(p.grad is not None and p.grad.abs().sum()>0 for p in module.parameters()))
         self.assertIsNone(self.model.head.weight.grad)

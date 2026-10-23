@@ -147,10 +147,9 @@ class WorldModel(nn.Module):
         return mean, log_std.clamp(-5, 2)
 
     def predict_features(self, memory, action):
-        current_memory = memory
         for block in self.predictor:
             memory = block(memory, action)
-        return current_memory + self.predictor_norm(memory)
+        return self.predictor_norm(memory)
 
     def predict_logits(self, memory, action):
         return self.decode_memory(self.predict_features(memory, action))
@@ -161,7 +160,9 @@ class WorldModel(nn.Module):
         return 15 * torch.tanh(logits/15)
 
     def forward(self, idx, targets, *, target_kl, kl_lambda=1., ce_weight=1., mse_weight=1.,
-                eqm_weight=0., eqm_lambda=1., eqm_chunk_size=128):
+                memory_loss='smooth_l1', eqm_weight=0., eqm_lambda=1., eqm_chunk_size=128):
+        if memory_loss not in ('mse', 'smooth_l1'):
+            raise ValueError('memory_loss must be mse or smooth_l1')
         if not math.isfinite(target_kl) or target_kl < 0:
             raise ValueError('target_kl must be finite and nonnegative')
         if not math.isfinite(kl_lambda) or kl_lambda < 0:
@@ -188,9 +189,10 @@ class WorldModel(nn.Module):
         logits = self.decode_memory(predicted_memory)
         valid = targets.ne(-1)
         count = valid.sum().clamp(min=1)
-        per_token_memory_loss = F.mse_loss(predicted_memory.float(), next_memory.float(),
-                                          reduction='none').mean(-1)
-        mse = (per_token_memory_loss*valid).sum()/count
+        memory_loss_fn = F.mse_loss if memory_loss == 'mse' else F.smooth_l1_loss
+        per_token_memory_loss = memory_loss_fn(predicted_memory.float(), next_memory.float(),
+                                               reduction='none').mean(-1)
+        memory_error = (per_token_memory_loss*valid).sum()/count
         ce = F.cross_entropy(logits.flatten(0, 1), targets.flatten(), ignore_index=-1, reduction='sum') / count
         # This probe measures next-character information in the compressor memory.
         # Its input is detached, and its objective is kept separate from model loss.
@@ -210,7 +212,7 @@ class WorldModel(nn.Module):
                                          chunk_size=eqm_chunk_size)
                if eqm_weight else logits.new_zeros(()))
         eqm_penalty = eqm_weight*eqm
-        return {'loss': ce_weight*ce + kl_penalty + mse_weight*mse + eqm_penalty,
+        return {'loss': ce_weight*ce + kl_penalty + mse_weight*memory_error + eqm_penalty,
                 'probe_ce': probe_ce, 'probe_accuracy': probe_accuracy,
-                'eqm': eqm, 'eqm_penalty': eqm_penalty, 'ce': ce, 'mse': mse, 'kl': kl,
+                'eqm': eqm, 'eqm_penalty': eqm_penalty, 'ce': ce, 'memory_loss': memory_error, 'kl': kl,
                 'kl_total': kl_total, 'kl_excess': kl_excess, 'kl_penalty': kl_penalty}
