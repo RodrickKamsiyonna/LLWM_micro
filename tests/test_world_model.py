@@ -52,7 +52,7 @@ class WorldModelTests(unittest.TestCase):
             torch.distributions.Normal(torch.zeros_like(mean), torch.ones_like(mean))).mean()
         torch.testing.assert_close(values['ce'], expected_ce)
         torch.testing.assert_close(values['kl'], expected_kl)
-        self.assertEqual(set(values), {'loss', 'ce', 'kl', 'kl_total', 'kl_excess', 'kl_penalty', 'smooth_l1', 'eqm', 'eqm_penalty', 'probe_ce', 'probe_accuracy'})
+        self.assertEqual(set(values), {'loss', 'ce', 'kl', 'kl_total', 'kl_excess', 'kl_penalty', 'mse', 'eqm', 'eqm_penalty', 'probe_ce', 'probe_accuracy'})
         values['ce'].backward()
         for name, p in self.model.named_parameters():
             if name.startswith('memory_probe.'):
@@ -87,7 +87,7 @@ class WorldModelTests(unittest.TestCase):
         targets = self.targets.clone()
         targets[:, -1] = -1
         values = self.model(self.idx, targets, ce_weight=0.3, target_kl=0., kl_lambda=0.2)
-        torch.testing.assert_close(values['loss'], 0.3*values['ce']+0.2*values['kl_total'].square()+values['smooth_l1'])
+        torch.testing.assert_close(values['loss'], 0.3*values['ce']+0.2*values['kl_total'].square()+values['mse'])
         ignored = self.model(self.idx, torch.full_like(targets, -1), target_kl=1.)
         self.assertEqual(ignored['loss'].item(), 0.)
         ignored['loss'].backward()
@@ -135,7 +135,7 @@ class WorldModelTests(unittest.TestCase):
         self.assertGreater(gradient[:, 0].abs().sum().item(), 1e-10)
         self.assertTrue(torch.isfinite(gradient).all())
 
-    def test_smooth_l1_targets_are_shifted_detached_compressor_memories(self):
+    def test_mse_targets_are_shifted_detached_compressor_memories(self):
         tokens = torch.randint(8, (2, 5))
         idx, targets = tokens[:, :-1], tokens[:, 1:]
         predicted = []
@@ -148,11 +148,11 @@ class WorldModelTests(unittest.TestCase):
         values = self.model(idx, targets, target_kl=1., mse_weight=0.7)
         with torch.no_grad():
             expected, _ = self.model.encode(tokens)
-        torch.testing.assert_close(values['smooth_l1'], F.smooth_l1_loss(predicted[0], expected[:, 1:], beta=1.))
-        gradient, = torch.autograd.grad(values['smooth_l1'], predicted[0], retain_graph=True)
-        torch.testing.assert_close(gradient, (predicted[0]-expected[:, 1:]).clamp(-1, 1)/predicted[0].numel())
-        torch.testing.assert_close(values['loss'], values['ce']+values['kl_penalty']+0.7*values['smooth_l1'])
-        values['smooth_l1'].backward()
+        torch.testing.assert_close(values['mse'], F.mse_loss(predicted[0], expected[:, 1:]))
+        gradient, = torch.autograd.grad(values['mse'], predicted[0], retain_graph=True)
+        torch.testing.assert_close(gradient, 2*(predicted[0]-expected[:, 1:])/predicted[0].numel())
+        torch.testing.assert_close(values['loss'], values['ce']+values['kl_penalty']+0.7*values['mse'])
+        values['mse'].backward()
         for module in [self.model.compressor, self.model.predictor, self.model.action_encoder]:
             self.assertTrue(any(p.grad is not None and p.grad.abs().sum()>0 for p in module.parameters()))
         self.assertIsNone(self.model.head.weight.grad)
