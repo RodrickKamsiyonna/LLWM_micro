@@ -14,9 +14,10 @@ class ModelConfig:
     heads: int = 4
     compressor_layers: int = 4
     predictor_layers: int = 3
-    action_dim: int = 32
+    action_dim: int = 128
     dropout: float = 0.1
     rope_base: float = 10000.
+    action_layers: int = 2
 
 
 @dataclass(frozen=True)
@@ -79,15 +80,17 @@ class AdaptiveBlock(nn.Module):
 
 
 class ActionEncoder(nn.Module):
-    """Halve concatenated memory width down to an action-dimensional bottleneck."""
-    def __init__(self, width, action_dim):
+    """Configurable-depth MLP that narrows to an action-dimensional bottleneck."""
+    def __init__(self, width, action_dim=128, num_layers=2):
         super().__init__()
         if action_dim < 1 or action_dim > 2*width:
             raise ValueError('action_dim must be positive and no larger than 2*width')
+        if num_layers < 1:
+            raise ValueError('action encoder layer count must be positive')
         layers = []
         current = 2*width
-        while current > action_dim:
-            following = max(action_dim, current//2)
+        for layer in range(num_layers):
+            following = action_dim if layer == num_layers-1 else max(action_dim, current//2)
             layers.extend((nn.Linear(current, following), nn.GELU()))
             current = following
         self.trunk = nn.Sequential(*layers)
@@ -112,7 +115,7 @@ class WorldModel(nn.Module):
         self.compressor_norm = nn.LayerNorm(c.width)
         freq = 1 / (c.rope_base ** (torch.arange(0, c.width//c.heads, 2).float()/(c.width//c.heads)))
         self.register_buffer('rope_frequency', freq, persistent=False)
-        self.action_encoder = ActionEncoder(c.width, c.action_dim)
+        self.action_encoder = ActionEncoder(c.width, c.action_dim, c.action_layers)
         self.predictor = nn.ModuleList([AdaptiveBlock(c) for _ in range(c.predictor_layers)])
         self.predictor_norm = nn.LayerNorm(c.width)
         self.head = nn.Linear(c.width, c.vocab_size)

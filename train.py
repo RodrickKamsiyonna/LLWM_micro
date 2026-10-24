@@ -34,7 +34,8 @@ def arguments():
     p.add_argument('--heads', type=int, default=4)
     p.add_argument('--compressor-layers', type=int, default=4)
     p.add_argument('--predictor-layers', type=int, default=3)
-    p.add_argument('--action-dim', type=int, default=32)
+    p.add_argument('--action-dim', type=int, choices=[128], default=128, help='action dimension is fixed at 128')
+    p.add_argument('--action-layers', type=int, default=2, help='hidden Linear/GELU layers in the action encoder; excludes mean/std heads')
     p.add_argument('--dropout', type=float, default=0.1)
     p.add_argument('--lr', type=float, default=3e-4)
     p.add_argument('--warmup', type=int, default=200)
@@ -62,9 +63,11 @@ def arguments():
     p.add_argument('--project', default='llm-world-model')
     p.add_argument('--run-name')
     a = p.parse_args()
-    for name in ['steps', 'batch_size', 'accumulation', 'context', 'eval_every', 'save_every', 'eval_batches', 'plan_horizon', 'plan_iterations']:
+    for name in ['steps', 'batch_size', 'accumulation', 'context', 'eval_every', 'save_every', 'eval_batches', 'plan_horizon', 'plan_iterations', 'action_layers']:
         if getattr(a, name) < 1:
             p.error(f'--{name.replace("_", "-")} must be positive')
+    if 2*a.width < a.action_dim:
+        p.error('--width must be at least 64 for the fixed 128-dimensional actions')
     if not math.isfinite(a.target_kl) or a.target_kl < 0:
         p.error('--target-kl must be finite and nonnegative')
     if not math.isfinite(a.kl_lambda) or a.kl_lambda < 0:
@@ -198,7 +201,7 @@ def main():
         starts = torch.randint(len(source)-args.context, (args.batch_size,))
         window = torch.stack([source[i:i+args.context+1] for i in starts]).to(device)
         return window[:, :-1], window[:, 1:]
-    config = ModelConfig(len(chars), args.context, args.width, args.heads, args.compressor_layers, args.predictor_layers, args.action_dim, args.dropout)
+    config = ModelConfig(len(chars), args.context, args.width, args.heads, args.compressor_layers, args.predictor_layers, args.action_dim, args.dropout, action_layers=args.action_layers)
     raw = WorldModel(config).to(device)
     optimizer = torch.optim.AdamW(raw.parameters(), lr=args.lr, weight_decay=0.01)
     scaler = (torch.amp.GradScaler('cuda', enabled=cuda) if hasattr(torch.amp, 'GradScaler')
@@ -211,7 +214,7 @@ def main():
         # Checkpoints include Python/NumPy RNG state: load only trusted local files.
         ckpt = torch.load(args.resume, map_location='cpu', weights_only=False)
         if ckpt['config'] != asdict(config) or ckpt['chars'] != chars:
-            raise ValueError('checkpoint architecture/configuration or vocabulary differs; old memory-MSE checkpoints need a fresh run')
+            raise ValueError('checkpoint architecture/configuration or vocabulary differs; match checkpoint settings or start a new run')
         import hashlib
         if ckpt['data_sha256'] != hashlib.sha256(text.encode()).hexdigest():
             raise ValueError('checkpoint dataset differs')
