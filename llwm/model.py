@@ -206,7 +206,7 @@ class WorldModel(nn.Module):
         kl = (per_dim_kl*valid[..., None]).sum()/(count*self.config.action_dim)
         # Total latent KL per valid token, averaged across this microbatch.
         kl_total = kl*self.config.action_dim
-        kl_excess = (kl_total-target_kl)
+        kl_excess = F.relu(kl_total-target_kl)
         kl_penalty = kl_lambda*kl_excess.square()
         eqm = (equilibrium_matching_loss(self, h, action, targets, eqm_lambda=eqm_lambda,
                                          chunk_size=eqm_chunk_size)
