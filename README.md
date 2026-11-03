@@ -1,28 +1,22 @@
-# Character-level latent-action language model
+# LLWM_micro: action-decoded character world model
 
-The compressor produces a causal sequence of memories `h[t]`. A Gaussian action encoder infers latent actions from detached adjacent compressor memories. A **causal Transformer predictor** consumes memory/action pairs and predicts the next memory at each position. Its attention uses RoPE and is limited to past and current positions.
+The causal Transformer **compressor** encodes a token prefix into a sequence of memories. A Gaussian action encoder infers actions from adjacent memories. The **predictor is an action-conditioned MLP**, independently applied to each (memory, action) transition. Its memory regression is supervised by the detached next compressor memory.
+
+The vocabulary decoder maps **actions directly to next-token logits**. It always receives `action.detach()`. The head's cross-entropy gradients therefore update **only the head**, never the action encoder, compressor, or predictor. The main loss contains memory regression and the KL budget; the separate `head_loss` is added to the backward objective without any shared gradient path. The `--ce-weight` option still scales the head CE. There is no EQM loss, memory probe, or head-training mode.
 
 ## Training
 
-```python
-h = compressor(input_tokens)
-mean, log_std = action_encoder(detach(h), detach(next_memory))
-action = mean + exp(log_std) * noise
-predicted_memory = causal_predictor(h, action)
-head_input = predicted_memory if head_training == "joint" else predicted_memory.detach()
-logits = vocabulary_head(head_input)
-loss = ce_weight * CE(logits, next_tokens) + kl_penalty + mse_weight * memory_loss(predicted_memory, detach(next_memory))
-```
-
-Use `--head-training joint` (default) to let token CE update the head, predictor, action encoder and compressor, or `--head-training detached` to train the vocabulary head from detached predicted memories. The memory prediction and KL objectives remain active in either mode. No EQM loss or detached compressor-memory probe is computed.
-
-Example:
-
 ```bash
-python train.py --target-kl 0.07 --head-training joint
-python train.py --target-kl 0.07 --head-training detached
+python train.py --target-kl 0.07 --memory-loss smooth_l1
 ```
 
-The predictor is trained in parallel on teacher-forced compressor memories with a causal attention mask. Planning uses the full prompt compressor-memory prefix, then recursively feeds predicted memories and optimized actions to the predictor using a bounded differentiable KV cache. The prompt-prefix actions are zero placeholders because no inferred prompt actions are available to the planner.
+## Goal-memory planning
 
-The predictor architecture differs from the old MLP, so start a fresh training run. Existing checkpoint resume requires matching architecture and vocabulary.
+1. Encode the prompt with the compressor.
+2. Encode the goal **after the prompt** using its compressor KV cache, obtaining a contextual target goal memory.
+3. Optimize a horizon-length sequence of actions through the recurrent MLP predictor to minimize MSE between the final predicted memory and the target goal memory.
+4. Decode each optimized action through the action-only vocabulary head to produce a token sequence.
+
+Planning uses **no token cross-entropy** and **no inverse-dynamics penalty**. The goal is a final memory-state target; when the horizon exceeds the number of goal tokens, the optimizer is free to choose intermediate actions. Decoded tokens may differ from the requested goal even when the final memory error is low. Planning reports both goal-memory MSE and exact decoded suffix match for diagnosis.
+
+The architecture is incompatible with earlier predictor checkpoints; start a fresh run.
