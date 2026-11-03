@@ -43,6 +43,7 @@ def arguments():
     p.add_argument('--kl-lambda', type=float, default=1., help='coefficient of squared KL excess above the target')
     p.add_argument('--kl-steps', type=int, default=0, help='linear coefficient warmup in optimizer updates; 0 disables, 1 reaches full strength immediately')
     p.add_argument('--ce-weight', type=float, default=1.)
+    p.add_argument('--head-training', choices=['joint', 'detached'], default='detached', help='joint: head CE gradients reach action encoder; detached: head-only CE')
     p.add_argument('--memory-loss', choices=['smooth_l1', 'mse'], default='smooth_l1', help='next-memory prediction loss')
     p.add_argument('--mse-weight', type=float, default=1., help='coefficient for the selected memory loss (legacy option name)')
     p.add_argument('--eval-every', type=int, default=500)
@@ -103,7 +104,7 @@ def restore_rng(state):
 
 def main():
     args = arguments()
-    loss_options = dict(target_kl=args.target_kl, kl_lambda=args.kl_lambda, ce_weight=args.ce_weight, mse_weight=args.mse_weight, memory_loss=args.memory_loss)
+    loss_options = dict(target_kl=args.target_kl, kl_lambda=args.kl_lambda, ce_weight=args.ce_weight, mse_weight=args.mse_weight, memory_loss=args.memory_loss, head_training=args.head_training)
     world = int(os.environ.get('WORLD_SIZE', 1))
     rank = int(os.environ.get('RANK', 0))
     local = int(os.environ.get('LOCAL_RANK', 0))
@@ -161,7 +162,7 @@ def main():
     scaler = (torch.amp.GradScaler('cuda', enabled=cuda) if hasattr(torch.amp, 'GradScaler')
               else torch.cuda.amp.GradScaler(enabled=cuda))
     start, best_val, run_id = 0, float('inf'), None
-    loss_signature = {'objective': 'action_decoder_mlp_goal_memory_v1', 'ce': args.ce_weight, 'memory_loss': args.memory_loss, 'memory_weight': args.mse_weight,
+    loss_signature = {'objective': 'action_decoder_mlp_goal_memory_v2', 'ce': args.ce_weight, 'memory_loss': args.memory_loss, 'memory_weight': args.mse_weight, 'head_training': args.head_training,
                       'target_kl': args.target_kl, 'kl_lambda': args.kl_lambda, 'kl_steps': args.kl_steps}
     if args.resume:
         # Checkpoints include Python/NumPy RNG state: load only trusted local files.
