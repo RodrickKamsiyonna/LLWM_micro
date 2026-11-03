@@ -2,12 +2,13 @@
 
 The causal Transformer **compressor** encodes a token prefix into a sequence of memories. A Gaussian action encoder infers actions from adjacent memories. The **predictor is an action-conditioned MLP**, independently applied to each (memory, action) transition. Its memory regression is supervised by the detached next compressor memory.
 
-The vocabulary decoder maps **actions directly to next-token logits**. It always receives `action.detach()`. The head's cross-entropy gradients therefore update **only the head**, never the action encoder, compressor, or predictor. The main loss contains memory regression and the KL budget; the separate `head_loss` is added to the backward objective without any shared gradient path. The `--ce-weight` option still scales the head CE. There is no EQM loss, memory probe, or head-training mode.
+The vocabulary decoder maps **actions directly to next-token logits**. Use `--head-training detached` (default) to feed `action.detach()` into the head, so its cross-entropy gradients update **only the head**. Use `--head-training joint` to feed the attached action, so CE also updates the action encoder through the sampled action (but not the compressor through its detached posterior inputs). The main loss contains memory regression and the KL budget; the separate `head_loss` is added to the backward objective without any shared gradient path. The `--ce-weight` option still scales the head CE. There is no EQM loss or memory probe.
 
 ## Training
 
 ```bash
-python train.py --target-kl 0.07 --memory-loss smooth_l1
+python train.py --target-kl 0.07 --memory-loss smooth_l1 --head-training detached
+python train.py --target-kl 0.07 --memory-loss smooth_l1 --head-training joint
 ```
 
 ## Goal-memory planning
