@@ -154,16 +154,16 @@ class WorldModel(nn.Module):
             memory = block(memory, action)
         return self.predictor_norm(memory)
 
-    def decode_action(self, action):
-        """Only the detached action trains the vocabulary decoder."""
-        logits = self.head(action.detach()).float()
+    def decode_action(self, action, *, detach=True):
+        """Decode actions; optionally block head CE gradients into the action encoder."""
+        logits = self.head(action.detach() if detach else action).float()
         return 15 * torch.tanh(logits/15)
 
     def predict_logits(self, memory, action):
         return self.decode_action(action)
 
     def forward(self, idx, targets, *, target_kl, kl_lambda=1., ce_weight=1., mse_weight=1.,
-                memory_loss='smooth_l1'):
+                memory_loss='smooth_l1', head_training='detached'):
         if memory_loss not in ('mse', 'smooth_l1'):
             raise ValueError('memory_loss must be mse or smooth_l1')
         if not math.isfinite(target_kl) or target_kl < 0:
@@ -172,6 +172,8 @@ class WorldModel(nn.Module):
             raise ValueError('kl_lambda must be finite and nonnegative')
         if not math.isfinite(mse_weight) or mse_weight < 0:
             raise ValueError('mse_weight must be finite and nonnegative')
+        if head_training not in ('joint', 'detached'):
+            raise ValueError('head_training must be joint or detached')
         if idx.shape != targets.shape:
             raise ValueError('idx and targets must have matching [batch, sequence] shapes')
         h, cache = self.encode(idx)
@@ -184,7 +186,7 @@ class WorldModel(nn.Module):
         std = log_std.exp()
         action = mean + std*torch.randn_like(mean)
         predicted_memory = self.predict_features(h, action)
-        logits = self.decode_action(action)
+        logits = self.decode_action(action, detach=(head_training == 'detached'))
         valid = targets.ne(-1)
         count = valid.sum().clamp(min=1)
         memory_loss_fn = F.mse_loss if memory_loss == 'mse' else F.smooth_l1_loss
