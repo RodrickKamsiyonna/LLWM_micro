@@ -1,21 +1,31 @@
-"""Optimize actions through autoregressive predicted-memory transitions."""
+"""Optimize actions through a cached causal memory predictor."""
 import math
 import torch
 from torch.nn import functional as F
 
 
 def rollout(model, memory, actions, *, return_consistency=False):
-    """Recur through memories; optionally infer each transition's own mean action."""
-    memories, previous = [], []
-    for action in actions.unbind(1):
-        previous.append(memory)
-        memory = model.predict_features(memory, action)
-        memories.append(memory)
-    states = torch.stack(memories, 1)
+    """Autoregressive predicted memories, conditioning on compressor prefix and actions."""
+    if memory.ndim == 2:
+        memory = memory[:, None, :]
+    if memory.ndim != 3 or actions.ndim != 3 or memory.size(0) != actions.size(0):
+        raise ValueError('memory must be [batch, prefix, width]; actions [batch, horizon, action_dim]')
+    prefix = memory[:, -model.config.context:]
+    cache = None
+    if prefix.size(1) > 1:
+        zeros = actions.new_zeros(prefix.size(0), prefix.size(1)-1, actions.size(-1))
+        _, cache = model.predict_features(prefix[:, :-1], zeros, return_cache=True)
+    current = prefix[:, -1:]
+    states, previous = [], []
+    for action in actions.split(1, dim=1):
+        previous.append(current)
+        current, cache = model.predict_features(current, action, kv_cache=cache, return_cache=True)
+        states.append(current)
+    states = torch.cat(states, dim=1)
     logits = model.decode_memory(states)
     if not return_consistency:
         return logits
-    mean, _ = model.posterior(torch.stack(previous, 1), states, detach_inputs=False)
+    mean, _ = model.posterior(torch.cat(previous, dim=1), states, detach_inputs=False)
     consistency = F.mse_loss(actions.float(), mean.float())
     return logits, consistency
 
@@ -34,8 +44,8 @@ def plan(model, prompt, goal, horizon=500, iterations=100, lr=0.05, seed=123, co
         p.requires_grad_(False)
     try:
         with torch.no_grad():
-            states, _ = model.encode(prompt[:, -model.config.context:])
-            initial = states[:, -1].detach()
+            initial, _ = model.encode(prompt[:, -model.config.context:])
+            initial = initial.detach()
         generator = torch.Generator(device=initial.device).manual_seed(seed)
         actions = torch.nn.Parameter(torch.randn((initial.size(0), horizon, model.config.action_dim), generator=generator, device=initial.device))
         targets = goal[None].expand(initial.size(0), -1)
