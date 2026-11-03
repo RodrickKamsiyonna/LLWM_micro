@@ -3,7 +3,6 @@ import math
 import torch
 from torch import nn
 from torch.nn import functional as F
-from .eqm import equilibrium_matching_loss
 
 
 @dataclass
@@ -67,18 +66,6 @@ class CausalBlock(nn.Module):
         return x, cache
 
 
-class AdaptiveBlock(nn.Module):
-    def __init__(self, c):
-        super().__init__()
-        self.norm = nn.LayerNorm(c.width, elementwise_affine=False)
-        self.condition = nn.Linear(c.action_dim, 2*c.width)
-        self.net = nn.Sequential(nn.Linear(c.width, 4*c.width), nn.GELU(), nn.Linear(4*c.width, c.width))
-
-    def forward(self, memory, action):
-        shift, scale = self.condition(action).chunk(2, -1)
-        return memory + self.net(self.norm(memory)*(1+scale) + shift)
-
-
 class ActionEncoder(nn.Module):
     """Configurable-depth MLP that narrows to an action-dimensional bottleneck."""
     def __init__(self, width, action_dim=128, num_layers=2):
@@ -116,12 +103,10 @@ class WorldModel(nn.Module):
         freq = 1 / (c.rope_base ** (torch.arange(0, c.width//c.heads, 2).float()/(c.width//c.heads)))
         self.register_buffer('rope_frequency', freq, persistent=False)
         self.action_encoder = ActionEncoder(c.width, c.action_dim, c.action_layers)
-        self.predictor = nn.ModuleList([AdaptiveBlock(c) for _ in range(c.predictor_layers)])
+        self.action_projection = nn.Linear(c.action_dim, c.width)
+        self.predictor = nn.ModuleList([CausalBlock(c) for _ in range(c.predictor_layers)])
         self.predictor_norm = nn.LayerNorm(c.width)
         self.head = nn.Linear(c.width, c.vocab_size)
-        # A diagnostic readout must not change the existing model's RNG stream.
-        with torch.random.fork_rng(devices=[]):
-            self.memory_probe = nn.Linear(c.width, c.vocab_size)
 
     def encode(self, idx=None, *, embeddings=None, kv_cache=None):
         """Encode IDs OR differentiable embeddings; return memories and bounded KV cache."""
@@ -149,10 +134,24 @@ class WorldModel(nn.Module):
         mean, log_std = self.action_encoder(inputs).chunk(2, -1)
         return mean, log_std.clamp(-5, 2)
 
-    def predict_features(self, memory, action):
-        for block in self.predictor:
-            memory = block(memory, action)
-        return self.predictor_norm(memory)
+    def predict_features(self, memory, action, *, kv_cache=None, return_cache=False):
+        """Causal action-conditioned memory prediction, with optional KV caching."""
+        if memory.ndim != 3 or action.shape != (*memory.shape[:2], self.config.action_dim):
+            raise ValueError('memory/action must be [batch, time, width/action_dim]')
+        position = 0 if kv_cache is None else kv_cache.position
+        if kv_cache is not None and len(kv_cache.layers) != len(self.predictor):
+            raise ValueError('predictor cache layer count mismatch')
+        x = memory + self.action_projection(action)
+        angles = torch.arange(position, position+x.size(1), device=x.device).float()[:, None] * self.rope_frequency
+        cos, sin = angles.cos().to(x.dtype), angles.sin().to(x.dtype)
+        caches = []
+        for i, block in enumerate(self.predictor):
+            x, cache = block(x, cos, sin, position, None if kv_cache is None else kv_cache.layers[i])
+            caches.append(cache)
+        result = self.predictor_norm(x)
+        if return_cache:
+            return result, KVCache(tuple(caches), position+x.size(1))
+        return result
 
     def predict_logits(self, memory, action):
         return self.decode_memory(self.predict_features(memory, action))
@@ -163,7 +162,7 @@ class WorldModel(nn.Module):
         return 15 * torch.tanh(logits/15)
 
     def forward(self, idx, targets, *, target_kl, kl_lambda=1., ce_weight=1., mse_weight=1.,
-                memory_loss='smooth_l1', eqm_weight=0., eqm_lambda=1., eqm_chunk_size=128):
+                memory_loss='smooth_l1', head_training='joint'):
         if memory_loss not in ('mse', 'smooth_l1'):
             raise ValueError('memory_loss must be mse or smooth_l1')
         if not math.isfinite(target_kl) or target_kl < 0:
@@ -172,11 +171,8 @@ class WorldModel(nn.Module):
             raise ValueError('kl_lambda must be finite and nonnegative')
         if not math.isfinite(mse_weight) or mse_weight < 0:
             raise ValueError('mse_weight must be finite and nonnegative')
-        for name, value in [('eqm_weight', eqm_weight), ('eqm_lambda', eqm_lambda)]:
-            if not math.isfinite(value) or value < 0:
-                raise ValueError(f'{name} must be finite and nonnegative')
-        if eqm_chunk_size < 0:
-            raise ValueError('eqm_chunk_size must be nonnegative')
+        if head_training not in ('joint', 'detached'):
+            raise ValueError('head_training must be joint or detached')
         if idx.shape != targets.shape:
             raise ValueError('idx and targets must have matching [batch, sequence] shapes')
         h, cache = self.encode(idx)
@@ -189,7 +185,7 @@ class WorldModel(nn.Module):
         std = log_std.exp()
         action = mean + std*torch.randn_like(mean)
         predicted_memory = self.predict_features(h, action)
-        logits = self.decode_memory(predicted_memory)
+        logits = self.decode_memory(predicted_memory if head_training == 'joint' else predicted_memory.detach())
         valid = targets.ne(-1)
         count = valid.sum().clamp(min=1)
         memory_loss_fn = F.mse_loss if memory_loss == 'mse' else F.smooth_l1_loss
@@ -197,13 +193,6 @@ class WorldModel(nn.Module):
                                                reduction='none').mean(-1)
         memory_error = (per_token_memory_loss*valid).sum()/count
         ce = F.cross_entropy(logits.flatten(0, 1), targets.flatten(), ignore_index=-1, reduction='sum') / count
-        # This probe measures next-character information in the compressor memory.
-        # Its input is detached, and its objective is kept separate from model loss.
-        probe_logits = self.memory_probe(h.detach()).float()
-        probe_logits = 15 * torch.tanh(probe_logits/15)
-        probe_ce = F.cross_entropy(probe_logits.flatten(0, 1), targets.flatten(),
-                                   ignore_index=-1, reduction='sum') / count
-        probe_accuracy = (probe_logits.argmax(-1).eq(targets) & valid).sum().float()/count
         # Mean over valid tokens AND action dimensions, matching the supplied VAE KL.
         per_dim_kl = 0.5*(mean.float().square() + (2*log_std.float()).exp() - 1 - 2*log_std.float())
         kl = (per_dim_kl*valid[..., None]).sum()/(count*self.config.action_dim)
@@ -211,11 +200,5 @@ class WorldModel(nn.Module):
         kl_total = kl*self.config.action_dim
         kl_excess = F.relu(kl_total-target_kl)
         kl_penalty = kl_lambda*kl_excess.square()
-        eqm = (equilibrium_matching_loss(self, h, action, targets, eqm_lambda=eqm_lambda,
-                                         chunk_size=eqm_chunk_size)
-               if eqm_weight else logits.new_zeros(()))
-        eqm_penalty = eqm_weight*eqm
-        return {'loss': ce_weight*ce + kl_penalty + mse_weight*memory_error + eqm_penalty,
-                'probe_ce': probe_ce, 'probe_accuracy': probe_accuracy,
-                'eqm': eqm, 'eqm_penalty': eqm_penalty, 'ce': ce, 'memory_loss': memory_error, 'kl': kl,
+        return {'loss': ce_weight*ce + kl_penalty + mse_weight*memory_error, 'ce': ce, 'memory_loss': memory_error, 'kl': kl,
                 'kl_total': kl_total, 'kl_excess': kl_excess, 'kl_penalty': kl_penalty}
