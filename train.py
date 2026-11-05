@@ -34,7 +34,7 @@ def arguments():
     p.add_argument('--heads', type=int, default=4)
     p.add_argument('--compressor-layers', type=int, default=4)
     p.add_argument('--predictor-layers', type=int, default=3)
-    p.add_argument('--action-dim', type=int, choices=[128], default=128, help='action dimension is fixed at 128')
+    p.add_argument('--action-dim', type=int, default=128, help='latent action dimension (positive; at most 2 * width)')
     p.add_argument('--action-layers', type=int, default=2, help='hidden Linear/GELU layers in the action encoder; excludes mean/std heads')
     p.add_argument('--dropout', type=float, default=0.1)
     p.add_argument('--lr', type=float, default=3e-4)
@@ -64,8 +64,8 @@ def arguments():
     for name in ['steps', 'batch_size', 'accumulation', 'context', 'eval_every', 'save_every', 'eval_batches', 'plan_horizon', 'plan_iterations', 'action_layers', 'prediction_horizon']:
         if getattr(a, name) < 1:
             p.error(f'--{name.replace("_", "-")} must be positive')
-    if 2*a.width < a.action_dim:
-        p.error('--width must be at least 64 for the fixed 128-dimensional actions')
+    if a.action_dim < 1 or a.action_dim > 2*a.width:
+        p.error('--action-dim must be between 1 and 2 * --width')
     if not math.isfinite(a.target_kl) or a.target_kl < 0:
         p.error('--target-kl must be finite and nonnegative')
     if not math.isfinite(a.kl_lambda) or a.kl_lambda < 0:
