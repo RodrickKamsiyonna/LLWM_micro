@@ -184,32 +184,42 @@ class WorldModel(nn.Module):
         with torch.no_grad():
             last, _ = self.encode(targets[:, -1:].clamp(min=0), kv_cache=cache)
         future = torch.cat((h[:, 1:].detach(), last), dim=1)
-        # Position t + j is represented by future[:, t+j-1].
+        # Infer one-step actions from consecutive *true* compressor memories.
+        # These actions are reused across overlapping recursive rollouts.
+        mean, log_std = self.posterior(h, future)
+        action = mean + log_std.exp()*torch.randn_like(mean)
         valid = targets.ne(-1)
         count = h.new_zeros(())
-        ce_sum, memory_sum, kl_sum = count, count, count
+        ce_sum, memory_sum = count, count
         memory_loss_fn = F.mse_loss if memory_loss == 'mse' else F.smooth_l1_loss
+        predicted = h
         for j in range(1, min(prediction_horizon, h.size(1))+1):
             n = h.size(1)-j+1
-            source = h[:, :n]
+            # predicted[:, t] represents the rollout starting at true h[:, t].
+            # Only j=1 uses the true starting memory; subsequent steps use
+            # the previous *predicted* memory and the next one-step action.
+            predicted = self.predict_features(predicted[:, :n], action[:, j-1:j-1+n])
             destination = future[:, j-1:j-1+n]
-            mean, log_std = self.posterior(source, destination)
-            action = mean + log_std.exp()*torch.randn_like(mean)
-            predicted = self.predict_features(source, action)
-            logits = self.decode_memory(predicted, detach=(head_training == 'detached'))
             target_ids = targets[:, j-1:j-1+n]
-            mask = valid[:, j-1:j-1+n]
+            # A rollout is valid only if every intermediate target is valid.
+            mask = valid[:, :n].clone()
+            for offset in range(1, j):
+                mask = mask & valid[:, offset:offset+n]
+            masked_ids = target_ids.masked_fill(~mask, -1)
+            logits = self.decode_memory(predicted, detach=(head_training == 'detached'))
             count = count + mask.sum()
-            ce_sum = ce_sum + F.cross_entropy(logits.reshape(-1, logits.size(-1)), target_ids.reshape(-1),
+            ce_sum = ce_sum + F.cross_entropy(logits.reshape(-1, logits.size(-1)), masked_ids.reshape(-1),
                                                 ignore_index=-1, reduction='sum')
             per_memory = memory_loss_fn(predicted.float(), destination.float(), reduction='none').mean(-1)
             memory_sum = memory_sum + (per_memory*mask).sum()
-            per_dim_kl = 0.5*(mean.float().square() + (2*log_std.float()).exp() - 1 - 2*log_std.float())
-            kl_sum = kl_sum + (per_dim_kl*mask[..., None]).sum()
+        # KL is charged once per inferred one-step action, not once per rollout
+        # that happens to reuse it.
+        action_count = valid.sum().clamp(min=1)
+        per_dim_kl = 0.5*(mean.float().square() + (2*log_std.float()).exp() - 1 - 2*log_std.float())
+        kl = (per_dim_kl*valid[..., None]).sum()/(action_count*self.config.action_dim)
         count = count.clamp(min=1)
         ce = ce_sum/count
         memory_error = memory_sum/count
-        kl = kl_sum/(count*self.config.action_dim)
         kl_total = kl*self.config.action_dim
         kl_excess = F.relu(kl_total-target_kl)
         kl_penalty = kl_lambda*kl_excess.square()
