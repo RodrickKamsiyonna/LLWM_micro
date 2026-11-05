@@ -1,4 +1,4 @@
-"""Plan in compressor memory space, then decode optimized actions to tokens."""
+"""Optimize actions using contextual goal memories and predicted-token head loss."""
 import math
 import torch
 from torch.nn import functional as F
@@ -17,12 +17,14 @@ def rollout(model, memory, actions):
     return torch.stack(states, dim=1)
 
 
-def plan(model, prompt, goal, horizon=500, iterations=100, lr=0.05, seed=123):
+def plan(model, prompt, goal, horizon=500, iterations=100, lr=0.05, seed=123, token_weight=1.0):
     """Match the final predicted memory to compressor(prompt + goal), then decode actions.
 
     The target is contextual: the goal tokens are encoded after the prompt, using
     the compressor cache. This avoids comparing unrelated absolute-position memories.
     """
+    if not math.isfinite(token_weight) or token_weight < 0:
+        raise ValueError('token_weight must be finite and nonnegative')
     if goal.ndim != 1 or goal.numel() < 1 or horizon < goal.numel() or iterations < 1:
         raise ValueError('goal must be nonempty; horizon >= goal length; iterations >= 1')
     if prompt.ndim != 2 or prompt.size(1) < 1:
@@ -50,26 +52,31 @@ def plan(model, prompt, goal, horizon=500, iterations=100, lr=0.05, seed=123):
             with torch.set_grad_enabled(i < iterations):
                 states = rollout(model, initial, actions)
                 goal_mse = F.mse_loss(states[:, -1].float(), goal_state.float())
-            value = float(goal_mse.detach())
+                logits = model.decode_memory(states[:, -goal.numel():])
+                goal_ce = F.cross_entropy(logits.reshape(-1, logits.size(-1)), goal_ids.reshape(-1))
+                objective = goal_mse + token_weight*goal_ce
+            value = float(objective.detach())
             if not math.isfinite(value):
                 raise RuntimeError('non-finite planning objective')
-            history.append({'iteration': i, 'loss': value, 'goal_memory_mse': value})
+            history.append({'iteration': i, 'loss': value, 'goal_memory_mse': float(goal_mse.detach()), 'goal_ce': float(goal_ce.detach())})
             if value < best_loss:
                 best_loss, best_actions = value, actions.detach().clone()
+                best_memory_mse, best_goal_ce = float(goal_mse.detach()), float(goal_ce.detach())
             if i < iterations:
                 optimizer.zero_grad(set_to_none=True)
-                goal_mse.backward()
+                objective.backward()
                 torch.nn.utils.clip_grad_norm_([actions], 1.)
                 optimizer.step()
         with torch.no_grad():
-            logits = model.decode_action(best_actions)
+            states = rollout(model, initial, best_actions)
+            logits = model.decode_memory(states)
             tokens = logits.argmax(-1)
             suffix = tokens[:, -goal.numel():]
             targets = goal[None].expand(initial.size(0), -1)
             exact = suffix.eq(targets).all(-1).float().mean().item()
         return {'tokens': tokens.cpu(), 'goal_tokens': suffix.cpu(),
                 'goal_exact_match': exact, 'history': history,
-                'best_loss': best_loss, 'goal_memory_mse': best_loss}
+                'best_loss': best_loss, 'goal_memory_mse': best_memory_mse, 'goal_ce': best_goal_ce}
     finally:
         for param, flag in zip(model.parameters(), flags):
             param.requires_grad_(flag)
