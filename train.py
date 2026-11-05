@@ -71,6 +71,10 @@ def arguments():
         p.error('--target-kl must be finite and nonnegative')
     if not math.isfinite(a.kl_lambda) or a.kl_lambda < 0:
         p.error('--kl-lambda must be finite and nonnegative')
+    if not math.isfinite(a.plan_lr) or a.plan_lr <= 0:
+        p.error('--plan-lr must be finite and positive')
+    if a.plan_execute_steps > a.plan_horizon:
+        p.error('--plan-execute-steps must not exceed --plan-horizon')
     if a.kl_steps < 0:
         p.error('--kl-steps must be nonnegative')
     if not math.isfinite(a.mse_weight) or a.mse_weight < 0:
@@ -295,20 +299,21 @@ def main():
                                   iterations=args.plan_iterations, lr=args.plan_lr)
                 row = {'step': step, 'prompt': args.prompt, 'goal': args.goal, 'rollout': decode(result['tokens'][0]),
                        'predicted_goal': decode(result['goal_tokens'][0]),
+                       'initial_loss': result['initial_loss'],
                        'best_loss': result['best_loss'], 'goal_ce': result['goal_ce'],
                        'round_history': result['round_history']}
                 row['goal_exact_match'] = result['goal_exact_match']
                 (out / f'plan_{step:07d}.json').write_text(json.dumps(row, indent=2))
                 print(json.dumps(row), flush=True)
-                metrics.update({'plan/initial_loss': result['round_history'][0]['goal_ce'],
+                metrics.update({'plan/initial_loss': result['initial_loss'],
                                  'plan/best_loss': row['best_loss'],
                                  'plan/goal_ce': row['goal_ce'],
                                  'plan/goal_exact_match': row['goal_exact_match']})
                 if run:
                     metrics['plan/text'] = wandb.Table(columns=['step', 'prompt', 'goal', 'rollout', 'predicted_goal'], data=[[step, args.prompt, args.goal, row['rollout'], row['predicted_goal']]])
                     metrics['plan/optimization'] = wandb.Table(
-                        columns=['start', 'horizon', 'executed', 'goal_ce'],
-                        data=[[r['start'], r['horizon'], r['executed'], r['goal_ce']]
+                        columns=['start', 'horizon', 'executed', 'initial_loss', 'goal_ce'],
+                        data=[[r['start'], r['horizon'], r['executed'], r['initial_loss'], r['goal_ce']]
                               for r in result['round_history']])
             if world > 1:
                 dist.barrier()
