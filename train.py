@@ -53,7 +53,6 @@ def arguments():
     p.add_argument('--plan-horizon', type=int, default=500)
     p.add_argument('--plan-iterations', type=int, default=100)
     p.add_argument('--plan-lr', type=float, default=0.05)
-    p.add_argument('--plan-token-weight', type=float, default=1.0, help='goal-token CE weight in action planning')
     p.add_argument('--prompt', default='ROMEO:\n')
     p.add_argument('--goal', default=' .')
     p.add_argument('--seed', type=int, default=1337)
@@ -75,8 +74,6 @@ def arguments():
         p.error('--kl-steps must be nonnegative')
     if not math.isfinite(a.mse_weight) or a.mse_weight < 0:
         p.error('--mse-weight must be finite and nonnegative')
-    if not math.isfinite(a.plan_token_weight) or a.plan_token_weight < 0:
-        p.error('--plan-token-weight must be finite and nonnegative')
     if not a.prompt or not a.goal:
         p.error('prompt and goal must be nonempty')
     return a
@@ -290,14 +287,14 @@ def main():
             improved = val['loss'] < best_val
             best_val = min(best_val, val['loss'])
             if rank == 0:
-                result = plan(raw, prompt, goal, args.plan_horizon, args.plan_iterations, args.plan_lr, token_weight=args.plan_token_weight)
+                result = plan(raw, prompt, goal, args.plan_horizon, args.plan_iterations, args.plan_lr)
                 row = {'step': step, 'prompt': args.prompt, 'goal': args.goal, 'rollout': decode(result['tokens'][0]),
                        'predicted_goal': decode(result['goal_tokens'][0]),
-                       'initial_loss': result['history'][0]['loss'], 'best_loss': result['best_loss'], 'goal_memory_mse': result['goal_memory_mse'], 'goal_ce': result['goal_ce'], 'history': result['history']}
+                       'initial_loss': result['history'][0]['loss'], 'best_loss': result['best_loss'], 'goal_ce': result['goal_ce'], 'history': result['history']}
                 row['goal_exact_match'] = result['goal_exact_match']
                 (out / f'plan_{step:07d}.json').write_text(json.dumps(row, indent=2))
                 print(json.dumps({k: v for k, v in row.items() if k != 'history'}), flush=True)
-                metrics.update({'plan/initial_loss': row['initial_loss'], 'plan/best_loss': row['best_loss'], 'plan/goal_memory_mse': row['goal_memory_mse'], 'plan/goal_ce': row['goal_ce'], 'plan/goal_exact_match': row['goal_exact_match']})
+                metrics.update({'plan/initial_loss': row['initial_loss'], 'plan/best_loss': row['best_loss'], 'plan/goal_ce': row['goal_ce'], 'plan/goal_exact_match': row['goal_exact_match']})
                 if run:
                     metrics['plan/text'] = wandb.Table(columns=['step', 'prompt', 'goal', 'rollout', 'predicted_goal'], data=[[step, args.prompt, args.goal, row['rollout'], row['predicted_goal']]])
                     metrics['plan/optimization'] = wandb.Table(columns=list(result['history'][0]), data=[list(h.values()) for h in result['history']])
