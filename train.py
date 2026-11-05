@@ -163,7 +163,7 @@ def main():
     scaler = (torch.amp.GradScaler('cuda', enabled=cuda) if hasattr(torch.amp, 'GradScaler')
               else torch.cuda.amp.GradScaler(enabled=cuda))
     start, best_val, run_id = 0, float('inf'), None
-    loss_signature = {'objective': 'direct_multihorizon_memory_head_v1', 'ce': args.ce_weight, 'memory_loss': args.memory_loss, 'memory_weight': args.mse_weight, 'head_training': args.head_training, 'prediction_horizon': args.prediction_horizon,
+    loss_signature = {'objective': 'recursive_multihorizon_memory_head_v2', 'ce': args.ce_weight, 'memory_loss': args.memory_loss, 'memory_weight': args.mse_weight, 'head_training': args.head_training, 'prediction_horizon': args.prediction_horizon,
                       'target_kl': args.target_kl, 'kl_lambda': args.kl_lambda, 'kl_steps': args.kl_steps}
     if args.resume:
         # Checkpoints include Python/NumPy RNG state: load only trusted local files.
