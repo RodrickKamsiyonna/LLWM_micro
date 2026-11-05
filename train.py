@@ -43,7 +43,8 @@ def arguments():
     p.add_argument('--kl-lambda', type=float, default=1., help='coefficient of squared KL excess above the target')
     p.add_argument('--kl-steps', type=int, default=0, help='linear coefficient warmup in optimizer updates; 0 disables, 1 reaches full strength immediately')
     p.add_argument('--ce-weight', type=float, default=1.)
-    p.add_argument('--head-training', choices=['joint', 'detached'], default='detached', help='joint: head CE gradients reach action encoder; detached: head-only CE')
+    p.add_argument('--head-training', choices=['joint', 'detached'], default='detached', help='joint: CE trains predictor and action encoder; detached: CE trains head only')
+    p.add_argument('--prediction-horizon', type=int, default=4, help='number of direct future-memory targets per starting memory')
     p.add_argument('--memory-loss', choices=['smooth_l1', 'mse'], default='smooth_l1', help='next-memory prediction loss')
     p.add_argument('--mse-weight', type=float, default=1., help='coefficient for the selected memory loss (legacy option name)')
     p.add_argument('--eval-every', type=int, default=500)
@@ -52,6 +53,7 @@ def arguments():
     p.add_argument('--plan-horizon', type=int, default=500)
     p.add_argument('--plan-iterations', type=int, default=100)
     p.add_argument('--plan-lr', type=float, default=0.05)
+    p.add_argument('--plan-token-weight', type=float, default=1.0, help='goal-token CE weight in action planning')
     p.add_argument('--prompt', default='ROMEO:\n')
     p.add_argument('--goal', default=' .')
     p.add_argument('--seed', type=int, default=1337)
@@ -60,7 +62,7 @@ def arguments():
     p.add_argument('--project', default='llm-world-model')
     p.add_argument('--run-name')
     a = p.parse_args()
-    for name in ['steps', 'batch_size', 'accumulation', 'context', 'eval_every', 'save_every', 'eval_batches', 'plan_horizon', 'plan_iterations', 'action_layers']:
+    for name in ['steps', 'batch_size', 'accumulation', 'context', 'eval_every', 'save_every', 'eval_batches', 'plan_horizon', 'plan_iterations', 'action_layers', 'prediction_horizon']:
         if getattr(a, name) < 1:
             p.error(f'--{name.replace("_", "-")} must be positive')
     if 2*a.width < a.action_dim:
@@ -73,6 +75,8 @@ def arguments():
         p.error('--kl-steps must be nonnegative')
     if not math.isfinite(a.mse_weight) or a.mse_weight < 0:
         p.error('--mse-weight must be finite and nonnegative')
+    if not math.isfinite(a.plan_token_weight) or a.plan_token_weight < 0:
+        p.error('--plan-token-weight must be finite and nonnegative')
     if not a.prompt or not a.goal:
         p.error('prompt and goal must be nonempty')
     return a
@@ -104,7 +108,7 @@ def restore_rng(state):
 
 def main():
     args = arguments()
-    loss_options = dict(target_kl=args.target_kl, kl_lambda=args.kl_lambda, ce_weight=args.ce_weight, mse_weight=args.mse_weight, memory_loss=args.memory_loss, head_training=args.head_training)
+    loss_options = dict(target_kl=args.target_kl, kl_lambda=args.kl_lambda, ce_weight=args.ce_weight, mse_weight=args.mse_weight, memory_loss=args.memory_loss, head_training=args.head_training, prediction_horizon=args.prediction_horizon)
     world = int(os.environ.get('WORLD_SIZE', 1))
     rank = int(os.environ.get('RANK', 0))
     local = int(os.environ.get('LOCAL_RANK', 0))
@@ -162,7 +166,7 @@ def main():
     scaler = (torch.amp.GradScaler('cuda', enabled=cuda) if hasattr(torch.amp, 'GradScaler')
               else torch.cuda.amp.GradScaler(enabled=cuda))
     start, best_val, run_id = 0, float('inf'), None
-    loss_signature = {'objective': 'action_decoder_mlp_goal_memory_v2', 'ce': args.ce_weight, 'memory_loss': args.memory_loss, 'memory_weight': args.mse_weight, 'head_training': args.head_training,
+    loss_signature = {'objective': 'direct_multihorizon_memory_head_v1', 'ce': args.ce_weight, 'memory_loss': args.memory_loss, 'memory_weight': args.mse_weight, 'head_training': args.head_training, 'prediction_horizon': args.prediction_horizon,
                       'target_kl': args.target_kl, 'kl_lambda': args.kl_lambda, 'kl_steps': args.kl_steps}
     if args.resume:
         # Checkpoints include Python/NumPy RNG state: load only trusted local files.
@@ -286,14 +290,14 @@ def main():
             improved = val['loss'] < best_val
             best_val = min(best_val, val['loss'])
             if rank == 0:
-                result = plan(raw, prompt, goal, args.plan_horizon, args.plan_iterations, args.plan_lr)
+                result = plan(raw, prompt, goal, args.plan_horizon, args.plan_iterations, args.plan_lr, token_weight=args.plan_token_weight)
                 row = {'step': step, 'prompt': args.prompt, 'goal': args.goal, 'rollout': decode(result['tokens'][0]),
                        'predicted_goal': decode(result['goal_tokens'][0]),
-                       'initial_loss': result['history'][0]['loss'], 'best_loss': result['best_loss'], 'goal_memory_mse': result['goal_memory_mse'], 'history': result['history']}
+                       'initial_loss': result['history'][0]['loss'], 'best_loss': result['best_loss'], 'goal_memory_mse': result['goal_memory_mse'], 'goal_ce': result['goal_ce'], 'history': result['history']}
                 row['goal_exact_match'] = result['goal_exact_match']
                 (out / f'plan_{step:07d}.json').write_text(json.dumps(row, indent=2))
                 print(json.dumps({k: v for k, v in row.items() if k != 'history'}), flush=True)
-                metrics.update({'plan/initial_loss': row['initial_loss'], 'plan/best_loss': row['best_loss'], 'plan/goal_memory_mse': row['goal_memory_mse'], 'plan/goal_exact_match': row['goal_exact_match']})
+                metrics.update({'plan/initial_loss': row['initial_loss'], 'plan/best_loss': row['best_loss'], 'plan/goal_memory_mse': row['goal_memory_mse'], 'plan/goal_ce': row['goal_ce'], 'plan/goal_exact_match': row['goal_exact_match']})
                 if run:
                     metrics['plan/text'] = wandb.Table(columns=['step', 'prompt', 'goal', 'rollout', 'predicted_goal'], data=[[step, args.prompt, args.goal, row['rollout'], row['predicted_goal']]])
                     metrics['plan/optimization'] = wandb.Table(columns=list(result['history'][0]), data=[list(h.values()) for h in result['history']])
