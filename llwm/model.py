@@ -118,7 +118,7 @@ class WorldModel(nn.Module):
         self.action_encoder = ActionEncoder(c.width, c.action_dim, c.action_layers)
         self.predictor = nn.ModuleList([AdaptiveBlock(c) for _ in range(c.predictor_layers)])
         self.predictor_norm = nn.LayerNorm(c.width)
-        self.head = nn.Linear(c.action_dim, c.vocab_size)
+        self.head = nn.Linear(c.width, c.vocab_size)
 
     def encode(self, idx=None, *, embeddings=None, kv_cache=None):
         """Encode IDs OR differentiable embeddings; return memories and bounded KV cache."""
@@ -154,16 +154,16 @@ class WorldModel(nn.Module):
             memory = block(memory, action)
         return self.predictor_norm(memory)
 
-    def decode_action(self, action, *, detach=True):
-        """Decode actions; optionally block head CE gradients into the action encoder."""
-        logits = self.head(action.detach() if detach else action).float()
+    def decode_memory(self, memory, *, detach=False):
+        """Decode predicted memories; detach only when training the head independently."""
+        logits = self.head(memory.detach() if detach else memory).float()
         return 15 * torch.tanh(logits/15)
 
     def predict_logits(self, memory, action):
-        return self.decode_action(action)
+        return self.decode_memory(self.predict_features(memory, action))
 
     def forward(self, idx, targets, *, target_kl, kl_lambda=1., ce_weight=1., mse_weight=1.,
-                memory_loss='smooth_l1', head_training='detached'):
+                memory_loss='smooth_l1', head_training='detached', prediction_horizon=4):
         if memory_loss not in ('mse', 'smooth_l1'):
             raise ValueError('memory_loss must be mse or smooth_l1')
         if not math.isfinite(target_kl) or target_kl < 0:
@@ -174,30 +174,42 @@ class WorldModel(nn.Module):
             raise ValueError('mse_weight must be finite and nonnegative')
         if head_training not in ('joint', 'detached'):
             raise ValueError('head_training must be joint or detached')
+        if not isinstance(prediction_horizon, int) or prediction_horizon < 1:
+            raise ValueError('prediction_horizon must be a positive integer')
         if idx.shape != targets.shape:
             raise ValueError('idx and targets must have matching [batch, sequence] shapes')
         h, cache = self.encode(idx)
-        # Contiguous shifted language-model windows: h[t+1] has seen x[t+1].
-        # Encode the final target with the existing cache to supervise every position.
+        # Include the last target token in the compressor sequence. All future
+        # targets for a given starting memory come from this same sequence.
         with torch.no_grad():
             last, _ = self.encode(targets[:, -1:].clamp(min=0), kv_cache=cache)
-            next_memory = torch.cat((h[:, 1:].detach(), last), dim=1)
-        mean, log_std = self.posterior(h, next_memory)
-        std = log_std.exp()
-        action = mean + std*torch.randn_like(mean)
-        predicted_memory = self.predict_features(h, action)
-        logits = self.decode_action(action, detach=(head_training == 'detached'))
+        future = torch.cat((h[:, 1:].detach(), last), dim=1)
+        # Position t + j is represented by future[:, t+j-1].
         valid = targets.ne(-1)
-        count = valid.sum().clamp(min=1)
+        count = h.new_zeros(())
+        ce_sum, memory_sum, kl_sum = count, count, count
         memory_loss_fn = F.mse_loss if memory_loss == 'mse' else F.smooth_l1_loss
-        per_token_memory_loss = memory_loss_fn(predicted_memory.float(), next_memory.float(),
-                                               reduction='none').mean(-1)
-        memory_error = (per_token_memory_loss*valid).sum()/count
-        ce = F.cross_entropy(logits.flatten(0, 1), targets.flatten(), ignore_index=-1, reduction='sum') / count
-        # Mean over valid tokens AND action dimensions, matching the supplied VAE KL.
-        per_dim_kl = 0.5*(mean.float().square() + (2*log_std.float()).exp() - 1 - 2*log_std.float())
-        kl = (per_dim_kl*valid[..., None]).sum()/(count*self.config.action_dim)
-        # Total latent KL per valid token, averaged across this microbatch.
+        for j in range(1, min(prediction_horizon, h.size(1))+1):
+            n = h.size(1)-j+1
+            source = h[:, :n]
+            destination = future[:, j-1:j-1+n]
+            mean, log_std = self.posterior(source, destination)
+            action = mean + log_std.exp()*torch.randn_like(mean)
+            predicted = self.predict_features(source, action)
+            logits = self.decode_memory(predicted, detach=(head_training == 'detached'))
+            target_ids = targets[:, j-1:j-1+n]
+            mask = valid[:, j-1:j-1+n]
+            count = count + mask.sum()
+            ce_sum = ce_sum + F.cross_entropy(logits.reshape(-1, logits.size(-1)), target_ids.reshape(-1),
+                                                ignore_index=-1, reduction='sum')
+            per_memory = memory_loss_fn(predicted.float(), destination.float(), reduction='none').mean(-1)
+            memory_sum = memory_sum + (per_memory*mask).sum()
+            per_dim_kl = 0.5*(mean.float().square() + (2*log_std.float()).exp() - 1 - 2*log_std.float())
+            kl_sum = kl_sum + (per_dim_kl*mask[..., None]).sum()
+        count = count.clamp(min=1)
+        ce = ce_sum/count
+        memory_error = memory_sum/count
+        kl = kl_sum/(count*self.config.action_dim)
         kl_total = kl*self.config.action_dim
         kl_excess = F.relu(kl_total-target_kl)
         kl_penalty = kl_lambda*kl_excess.square()
