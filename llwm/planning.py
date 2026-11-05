@@ -1,4 +1,4 @@
-"""Optimize actions using contextual goal memories and predicted-token head loss."""
+"""Optimize actions using only vocabulary-head goal-token cross-entropy."""
 import math
 import torch
 from torch.nn import functional as F
@@ -17,14 +17,8 @@ def rollout(model, memory, actions):
     return torch.stack(states, dim=1)
 
 
-def plan(model, prompt, goal, horizon=500, iterations=100, lr=0.05, seed=123, token_weight=1.0):
-    """Match the final predicted memory to compressor(prompt + goal), then decode actions.
-
-    The target is contextual: the goal tokens are encoded after the prompt, using
-    the compressor cache. This avoids comparing unrelated absolute-position memories.
-    """
-    if not math.isfinite(token_weight) or token_weight < 0:
-        raise ValueError('token_weight must be finite and nonnegative')
+def plan(model, prompt, goal, horizon=500, iterations=100, lr=0.05, seed=123):
+    """Optimize actions so the vocabulary head predicts the requested goal suffix."""
     if goal.ndim != 1 or goal.numel() < 1 or horizon < goal.numel() or iterations < 1:
         raise ValueError('goal must be nonempty; horizon >= goal length; iterations >= 1')
     if prompt.ndim != 2 or prompt.size(1) < 1:
@@ -36,12 +30,9 @@ def plan(model, prompt, goal, horizon=500, iterations=100, lr=0.05, seed=123, to
         param.requires_grad_(False)
     try:
         with torch.no_grad():
-            prefix, cache = model.encode(prompt[:, -model.config.context:])
+            prefix, _ = model.encode(prompt[:, -model.config.context:])
             initial = prefix[:, -1].detach()
-            # The goal representation must include the prompt as causal context.
             goal_ids = goal[None].expand(prompt.size(0), -1)
-            goal_memories, _ = model.encode(goal_ids, kv_cache=cache)
-            goal_state = goal_memories[:, -1].detach()
         generator = torch.Generator(device=initial.device).manual_seed(seed)
         actions = torch.nn.Parameter(torch.randn(
             (initial.size(0), horizon, model.config.action_dim),
@@ -51,17 +42,16 @@ def plan(model, prompt, goal, horizon=500, iterations=100, lr=0.05, seed=123, to
         for i in range(iterations+1):
             with torch.set_grad_enabled(i < iterations):
                 states = rollout(model, initial, actions)
-                goal_mse = F.mse_loss(states[:, -1].float(), goal_state.float())
                 logits = model.decode_memory(states[:, -goal.numel():])
                 goal_ce = F.cross_entropy(logits.reshape(-1, logits.size(-1)), goal_ids.reshape(-1))
-                objective = goal_mse + token_weight*goal_ce
+                objective = goal_ce
             value = float(objective.detach())
             if not math.isfinite(value):
                 raise RuntimeError('non-finite planning objective')
-            history.append({'iteration': i, 'loss': value, 'goal_memory_mse': float(goal_mse.detach()), 'goal_ce': float(goal_ce.detach())})
+            history.append({'iteration': i, 'loss': value, 'goal_ce': value})
             if value < best_loss:
                 best_loss, best_actions = value, actions.detach().clone()
-                best_memory_mse, best_goal_ce = float(goal_mse.detach()), float(goal_ce.detach())
+                best_goal_ce = value
             if i < iterations:
                 optimizer.zero_grad(set_to_none=True)
                 objective.backward()
@@ -76,7 +66,7 @@ def plan(model, prompt, goal, horizon=500, iterations=100, lr=0.05, seed=123, to
             exact = suffix.eq(targets).all(-1).float().mean().item()
         return {'tokens': tokens.cpu(), 'goal_tokens': suffix.cpu(),
                 'goal_exact_match': exact, 'history': history,
-                'best_loss': best_loss, 'goal_memory_mse': best_memory_mse, 'goal_ce': best_goal_ce}
+                'best_loss': best_loss, 'goal_ce': best_goal_ce}
     finally:
         for param, flag in zip(model.parameters(), flags):
             param.requires_grad_(flag)
