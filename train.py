@@ -14,7 +14,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from llwm import ModelConfig, WorldModel
-from llwm.planning import plan
+from llwm.planning import mpc_plan
 from prepare import default_data_path, prepare_dataset
 
 LOSS_KEYS = ('loss', 'ce', 'kl', 'kl_total', 'kl_excess', 'kl_penalty', 'memory_loss', 'head_loss')
@@ -50,7 +50,8 @@ def arguments():
     p.add_argument('--eval-every', type=int, default=500)
     p.add_argument('--save-every', type=int, default=500)
     p.add_argument('--eval-batches', type=int, default=20)
-    p.add_argument('--plan-horizon', type=int, default=500)
+    p.add_argument('--plan-horizon', type=int, default=50)
+    p.add_argument('--plan-execute-steps', type=int, default=5)
     p.add_argument('--plan-iterations', type=int, default=100)
     p.add_argument('--plan-lr', type=float, default=0.05)
     p.add_argument('--prompt', default='ROMEO:\n')
@@ -61,7 +62,7 @@ def arguments():
     p.add_argument('--project', default='llm-world-model')
     p.add_argument('--run-name')
     a = p.parse_args()
-    for name in ['steps', 'batch_size', 'accumulation', 'context', 'eval_every', 'save_every', 'eval_batches', 'plan_horizon', 'plan_iterations', 'action_layers', 'prediction_horizon']:
+    for name in ['steps', 'batch_size', 'accumulation', 'context', 'eval_every', 'save_every', 'eval_batches', 'plan_horizon', 'plan_execute_steps', 'plan_iterations', 'action_layers', 'prediction_horizon']:
         if getattr(a, name) < 1:
             p.error(f'--{name.replace("_", "-")} must be positive')
     if a.action_dim < 1 or a.action_dim > 2*a.width:
@@ -145,6 +146,8 @@ def main():
     def decode(t):
         return ''.join(chars[i] for i in t.tolist())
     prompt, goal = encode(args.prompt)[None], encode(args.goal)
+    if args.plan_execute_steps > args.plan_horizon:
+        raise ValueError('plan-execute-steps must not exceed plan-horizon')
     if args.plan_horizon < goal.numel():
         raise ValueError('planning horizon must include the entire goal sequence')
     data = torch.tensor([stoi[ch] for ch in text], dtype=torch.long)
@@ -287,10 +290,13 @@ def main():
             improved = val['loss'] < best_val
             best_val = min(best_val, val['loss'])
             if rank == 0:
-                result = plan(raw, prompt, goal, args.plan_horizon, args.plan_iterations, args.plan_lr)
+                result = mpc_plan(raw, prompt, goal, horizon=args.plan_horizon,
+                                  execute_steps=args.plan_execute_steps,
+                                  iterations=args.plan_iterations, lr=args.plan_lr)
                 row = {'step': step, 'prompt': args.prompt, 'goal': args.goal, 'rollout': decode(result['tokens'][0]),
                        'predicted_goal': decode(result['goal_tokens'][0]),
-                       'initial_loss': result['history'][0]['loss'], 'best_loss': result['best_loss'], 'goal_ce': result['goal_ce'], 'history': result['history']}
+                       'best_loss': result['best_loss'], 'goal_ce': result['goal_ce'],
+                       'round_history': result['round_history']}
                 row['goal_exact_match'] = result['goal_exact_match']
                 (out / f'plan_{step:07d}.json').write_text(json.dumps(row, indent=2))
                 print(json.dumps({k: v for k, v in row.items() if k != 'history'}), flush=True)
