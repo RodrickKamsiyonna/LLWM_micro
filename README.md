@@ -23,12 +23,12 @@ python train.py --target-kl 0.07 --prediction-horizon 4 --head-training joint
 
 ## Planning
 
-The planner encodes the prompt and then encodes goal tokens *after the prompt* to obtain a contextual goal memory. It optimizes a sequence of actions through an autoregressive MLP rollout using both the **final goal-memory MSE** and the **vocabulary head CE on the final goal-length tokens**:
+The planner encodes the prompt to obtain its starting memory. It optimizes a sequence of actions through an autoregressive MLP rollout using **only vocabulary-head cross-entropy on the final goal-length tokens**:
 
 ```
-planning_loss = goal_memory_mse + plan_token_weight * goal_token_ce
+planning_loss = goal_token_ce
 ```
 
-Use `--plan-token-weight` (default `1.0`) to control the token component. Optimized predicted memories are decoded by the vocabulary head; **actions are never decoded directly**. No inverse-dynamics planning loss, EQM or memory probe is used.
+Optimized predicted memories are decoded by the vocabulary head; **actions are never decoded directly**. No inverse-dynamics planning loss, EQM or memory probe is used.
 
 Note: training uses direct multi-horizon transitions while planning still rolls the MLP forward to produce a token sequence. The mismatch is intentional but should be evaluated experimentally. Changing the vocabulary head input size invalidates earlier head checkpoints; start a fresh training run.
