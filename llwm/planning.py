@@ -25,6 +25,8 @@ def mpc_plan(model, prompt, goal, horizon=50, execute_steps=5, iterations=100,
         raise ValueError("invalid execution horizon or goal length")
     if prompt.ndim != 2 or prompt.size(1) < 1 or goal.ndim != 1 or iterations < 1:
         raise ValueError("invalid prompt, goal or iterations")
+    if not math.isfinite(lr) or lr <= 0:
+        raise ValueError("MPC learning rate must be finite and positive")
     training = model.training
     flags = [p.requires_grad for p in model.parameters()]
     model.eval()
@@ -49,7 +51,7 @@ def mpc_plan(model, prompt, goal, horizon=50, execute_steps=5, iterations=100,
             actions = torch.nn.Parameter(init)
             optimizer = torch.optim.Adam([actions], lr=lr)
             targets = goal[None].expand(prefix.size(0), -1)
-            best_loss, best_actions = float("inf"), None
+            best_loss, best_actions, initial_loss = float("inf"), None, None
             for iteration in range(iterations + 1):
                 with torch.set_grad_enabled(iteration < iterations):
                     states = rollout(model, initial, actions)
@@ -59,6 +61,8 @@ def mpc_plan(model, prompt, goal, horizon=50, execute_steps=5, iterations=100,
                 value = float(loss.detach())
                 if not math.isfinite(value):
                     raise RuntimeError("non-finite MPC objective")
+                if initial_loss is None:
+                    initial_loss = value
                 if value < best_loss:
                     best_loss, best_actions = value, actions.detach().clone()
                 if iteration < iterations:
@@ -77,11 +81,13 @@ def mpc_plan(model, prompt, goal, horizon=50, execute_steps=5, iterations=100,
                     initial = new_memory[:, -1]
             warm, previous_count = best_actions, count
             rounds.append({"start": start, "horizon": remaining,
-                           "executed": count, "goal_ce": best_loss})
+                           "executed": count, "initial_loss": initial_loss,
+                           "goal_ce": best_loss})
         tokens = torch.stack(generated, dim=1)
         suffix = tokens[:, -goal.numel():]
         return {"tokens": tokens.cpu(), "goal_tokens": suffix.cpu(),
                 "goal_exact_match": suffix.eq(goal[None]).all(-1).float().mean().item(),
+                "initial_loss": rounds[0]["initial_loss"],
                 "goal_ce": rounds[-1]["goal_ce"], "best_loss": rounds[-1]["goal_ce"],
                 "round_history": rounds}
     finally:
