@@ -1,23 +1,34 @@
-# LLWM_micro: action-decoded character world model
+# LLWM_micro: direct multi-horizon latent-action world model
 
-The causal Transformer **compressor** encodes a token prefix into a sequence of memories. A Gaussian action encoder infers actions from adjacent memories. The **predictor is an action-conditioned MLP**, independently applied to each (memory, action) transition. Its memory regression is supervised by the detached next compressor memory.
+The causal Transformer compressor encodes token sequences into memories. The Gaussian action encoder infers a *direct* action between each source memory and each future target memory, up to `--prediction-horizon k`. The action-conditioned MLP predictor maps each **original source memory and inferred action** directly to that target. There is **no recursive rollout during multi-horizon training**.
 
-The vocabulary decoder maps **actions directly to next-token logits**. Use `--head-training detached` (default) to feed `action.detach()` into the head, so its cross-entropy gradients update **only the head**. Use `--head-training joint` to feed the attached action, so CE also updates the action encoder through the sampled action (but not the compressor through its detached posterior inputs). The main loss contains memory regression and the KL budget; the separate `head_loss` is added to the backward objective without any shared gradient path. The `--ce-weight` option still scales the head CE. There is no EQM loss or memory probe.
+For each offset `j=1,...,k` and valid source `h[t]`:
+
+```python
+action[t,j] = action_encoder(h[t].detach(), h[t+j].detach())
+predicted[t,j] = predictor(h[t], action[t,j])
+memory_loss += distance(predicted[t,j], h[t+j].detach())
+token_logits[t,j] = vocabulary_head(predicted[t,j].detach() if detached else predicted[t,j])
+token_ce += CE(token_logits[t,j], token[t+j])
+```
+
+Memory regression, token CE and action KL are averaged over **all valid (start, offset) pairs**. `--head-training detached` (default) isolates the vocabulary head's CE gradients; `joint` lets CE also train the predictor and action encoder. Posterior inputs are detached in both modes, but the predictor's source memory remains differentiable.
 
 ## Training
 
 ```bash
-python train.py --target-kl 0.07 --memory-loss smooth_l1 --head-training detached
-python train.py --target-kl 0.07 --memory-loss smooth_l1 --head-training joint
+python train.py --target-kl 0.07 --prediction-horizon 4 --head-training detached
+python train.py --target-kl 0.07 --prediction-horizon 4 --head-training joint
 ```
 
-## Goal-memory planning
+## Planning
 
-1. Encode the prompt with the compressor.
-2. Encode the goal **after the prompt** using its compressor KV cache, obtaining a contextual target goal memory.
-3. Optimize a horizon-length sequence of actions through the recurrent MLP predictor to minimize MSE between the final predicted memory and the target goal memory.
-4. Decode each optimized action through the action-only vocabulary head to produce a token sequence.
+The planner encodes the prompt and then encodes goal tokens *after the prompt* to obtain a contextual goal memory. It optimizes a sequence of actions through an autoregressive MLP rollout using both the **final goal-memory MSE** and the **vocabulary head CE on the final goal-length tokens**:
 
-Planning uses **no token cross-entropy** and **no inverse-dynamics penalty**. The goal is a final memory-state target; when the horizon exceeds the number of goal tokens, the optimizer is free to choose intermediate actions. Decoded tokens may differ from the requested goal even when the final memory error is low. Planning reports both goal-memory MSE and exact decoded suffix match for diagnosis.
+```
+planning_loss = goal_memory_mse + plan_token_weight * goal_token_ce
+```
 
-The architecture is incompatible with earlier predictor checkpoints; start a fresh run.
+Use `--plan-token-weight` (default `1.0`) to control the token component. Optimized predicted memories are decoded by the vocabulary head; **actions are never decoded directly**. No inverse-dynamics planning loss, EQM or memory probe is used.
+
+Note: training uses direct multi-horizon transitions while planning still rolls the MLP forward to produce a token sequence. The mismatch is intentional but should be evaluated experimentally. Changing the vocabulary head input size invalidates earlier head checkpoints; start a fresh training run.
