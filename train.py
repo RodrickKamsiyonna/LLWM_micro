@@ -299,11 +299,17 @@ def main():
                        'round_history': result['round_history']}
                 row['goal_exact_match'] = result['goal_exact_match']
                 (out / f'plan_{step:07d}.json').write_text(json.dumps(row, indent=2))
-                print(json.dumps({k: v for k, v in row.items() if k != 'history'}), flush=True)
-                metrics.update({'plan/initial_loss': row['initial_loss'], 'plan/best_loss': row['best_loss'], 'plan/goal_ce': row['goal_ce'], 'plan/goal_exact_match': row['goal_exact_match']})
+                print(json.dumps(row), flush=True)
+                metrics.update({'plan/initial_loss': result['round_history'][0]['goal_ce'],
+                                 'plan/best_loss': row['best_loss'],
+                                 'plan/goal_ce': row['goal_ce'],
+                                 'plan/goal_exact_match': row['goal_exact_match']})
                 if run:
                     metrics['plan/text'] = wandb.Table(columns=['step', 'prompt', 'goal', 'rollout', 'predicted_goal'], data=[[step, args.prompt, args.goal, row['rollout'], row['predicted_goal']]])
-                    metrics['plan/optimization'] = wandb.Table(columns=list(result['history'][0]), data=[list(h.values()) for h in result['history']])
+                    metrics['plan/optimization'] = wandb.Table(
+                        columns=['start', 'horizon', 'executed', 'goal_ce'],
+                        data=[[r['start'], r['horizon'], r['executed'], r['goal_ce']]
+                              for r in result['round_history']])
             if world > 1:
                 dist.barrier()
             restore_rng(state)
