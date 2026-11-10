@@ -17,7 +17,7 @@ from llwm import ModelConfig, WorldModel
 from llwm.planning import mpc_plan
 from prepare import default_data_path, prepare_dataset
 
-LOSS_KEYS = ('loss', 'ce', 'kl', 'kl_total', 'kl_excess', 'kl_penalty', 'memory_loss', 'head_loss')
+LOSS_KEYS = ('loss', 'embedding_mse', 'kl', 'kl_total', 'kl_excess', 'kl_penalty')
 
 
 def arguments():
@@ -42,11 +42,7 @@ def arguments():
     p.add_argument('--target-kl', type=float, required=True, help='total KL budget in nats per valid token (sum over action dimensions)')
     p.add_argument('--kl-lambda', type=float, default=1., help='coefficient of squared KL excess above the target')
     p.add_argument('--kl-steps', type=int, default=0, help='linear coefficient warmup in optimizer updates; 0 disables, 1 reaches full strength immediately')
-    p.add_argument('--ce-weight', type=float, default=1.)
-    p.add_argument('--head-training', choices=['joint', 'detached'], default='detached', help='joint: CE trains predictor and action encoder; detached: CE trains head only')
-    p.add_argument('--prediction-horizon', type=int, default=4, help='number of direct future-memory targets per starting memory')
-    p.add_argument('--memory-loss', choices=['smooth_l1', 'mse'], default='smooth_l1', help='next-memory prediction loss')
-    p.add_argument('--mse-weight', type=float, default=1., help='coefficient for the selected memory loss (legacy option name)')
+    p.add_argument('--mse-weight', type=float, default=1., help='coefficient for token embedding MSE')
     p.add_argument('--eval-every', type=int, default=500)
     p.add_argument('--save-every', type=int, default=500)
     p.add_argument('--eval-batches', type=int, default=20)
@@ -62,7 +58,7 @@ def arguments():
     p.add_argument('--project', default='llm-world-model')
     p.add_argument('--run-name')
     a = p.parse_args()
-    for name in ['steps', 'batch_size', 'accumulation', 'context', 'eval_every', 'save_every', 'eval_batches', 'plan_horizon', 'plan_execute_steps', 'plan_iterations', 'action_layers', 'prediction_horizon']:
+    for name in ['steps', 'batch_size', 'accumulation', 'context', 'eval_every', 'save_every', 'eval_batches', 'plan_horizon', 'plan_execute_steps', 'plan_iterations', 'action_layers']:
         if getattr(a, name) < 1:
             p.error(f'--{name.replace("_", "-")} must be positive')
     if a.action_dim < 1 or a.action_dim > 2*a.width:
@@ -110,7 +106,7 @@ def restore_rng(state):
 
 def main():
     args = arguments()
-    loss_options = dict(target_kl=args.target_kl, kl_lambda=args.kl_lambda, ce_weight=args.ce_weight, mse_weight=args.mse_weight, memory_loss=args.memory_loss, head_training=args.head_training, prediction_horizon=args.prediction_horizon)
+    loss_options = dict(target_kl=args.target_kl, kl_lambda=args.kl_lambda, mse_weight=args.mse_weight)
     world = int(os.environ.get('WORLD_SIZE', 1))
     rank = int(os.environ.get('RANK', 0))
     local = int(os.environ.get('LOCAL_RANK', 0))
@@ -170,7 +166,7 @@ def main():
     scaler = (torch.amp.GradScaler('cuda', enabled=cuda) if hasattr(torch.amp, 'GradScaler')
               else torch.cuda.amp.GradScaler(enabled=cuda))
     start, best_val, run_id = 0, float('inf'), None
-    loss_signature = {'objective': 'recursive_multihorizon_memory_head_v2', 'ce': args.ce_weight, 'memory_loss': args.memory_loss, 'memory_weight': args.mse_weight, 'head_training': args.head_training, 'prediction_horizon': args.prediction_horizon,
+    loss_signature = {'objective': 'one_step_embedding_mse_v4', 'memory_weight': args.mse_weight,
                       'target_kl': args.target_kl, 'kl_lambda': args.kl_lambda, 'kl_steps': args.kl_steps}
     if args.resume:
         # Checkpoints include Python/NumPy RNG state: load only trusted local files.
@@ -263,9 +259,9 @@ def main():
             with sync:
                 with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=cuda):
                     values = model(*batch('train'), **train_loss_options)
-                if not torch.isfinite(values['loss']) or not torch.isfinite(values['head_loss']):
+                if not torch.isfinite(values['loss']):
                     raise RuntimeError(f'nonfinite loss at step {step}')
-                scaler.scale((values['loss'] + values['head_loss'])/args.accumulation).backward()
+                scaler.scale(values['loss']/args.accumulation).backward()
             for k in totals:
                 totals[k] += values[k].detach()/args.accumulation
         scaler.unscale_(optimizer)
@@ -300,20 +296,20 @@ def main():
                 row = {'step': step, 'prompt': args.prompt, 'goal': args.goal, 'rollout': decode(result['tokens'][0]),
                        'predicted_goal': decode(result['goal_tokens'][0]),
                        'initial_loss': result['initial_loss'],
-                       'best_loss': result['best_loss'], 'goal_ce': result['goal_ce'],
+                       'best_loss': result['best_loss'], 'goal_mse': result['goal_mse'],
                        'round_history': result['round_history']}
                 row['goal_exact_match'] = result['goal_exact_match']
                 (out / f'plan_{step:07d}.json').write_text(json.dumps(row, indent=2))
                 print(json.dumps(row), flush=True)
                 metrics.update({'plan/initial_loss': result['initial_loss'],
                                  'plan/best_loss': row['best_loss'],
-                                 'plan/goal_ce': row['goal_ce'],
+                                 'plan/goal_mse': row['goal_mse'],
                                  'plan/goal_exact_match': row['goal_exact_match']})
                 if run:
                     metrics['plan/text'] = wandb.Table(columns=['step', 'prompt', 'goal', 'rollout', 'predicted_goal'], data=[[step, args.prompt, args.goal, row['rollout'], row['predicted_goal']]])
                     metrics['plan/optimization'] = wandb.Table(
-                        columns=['start', 'horizon', 'executed', 'initial_loss', 'goal_ce'],
-                        data=[[r['start'], r['horizon'], r['executed'], r['initial_loss'], r['goal_ce']]
+                        columns=['start', 'horizon', 'executed', 'initial_loss', 'goal_mse'],
+                        data=[[r['start'], r['horizon'], r['executed'], r['initial_loss'], r['goal_mse']]
                               for r in result['round_history']])
             if world > 1:
                 dist.barrier()

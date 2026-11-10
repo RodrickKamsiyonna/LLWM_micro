@@ -118,7 +118,7 @@ class WorldModel(nn.Module):
         self.action_encoder = ActionEncoder(c.width, c.action_dim, c.action_layers)
         self.predictor = nn.ModuleList([AdaptiveBlock(c) for _ in range(c.predictor_layers)])
         self.predictor_norm = nn.LayerNorm(c.width)
-        self.head = nn.Linear(c.width, c.vocab_size)
+        self.embedding_output = nn.Linear(c.width, c.width)
 
     def encode(self, idx=None, *, embeddings=None, kv_cache=None):
         """Encode IDs OR differentiable embeddings; return memories and bounded KV cache."""
@@ -138,11 +138,11 @@ class WorldModel(nn.Module):
             caches.append(layer_cache)
         return self.compressor_norm(x), KVCache(tuple(caches), position+x.size(1))
 
-    def posterior(self, memory, next_memory, *, detach_inputs=True):
-        # Training stops encoder-input gradients; planning differentiates transitions.
+    def posterior(self, memory, next_embedding, *, detach_inputs=True):
+        # Callers may detach posterior inputs or train through the memory path.
         if detach_inputs:
-            memory, next_memory = memory.detach(), next_memory.detach()
-        inputs = torch.cat((memory, next_memory), -1)
+            memory, next_embedding = memory.detach(), next_embedding.detach()
+        inputs = torch.cat((memory, next_embedding), -1)
         mean, log_std = self.action_encoder(inputs).chunk(2, -1)
         return mean, log_std.clamp(-5, 2)
 
@@ -154,74 +154,41 @@ class WorldModel(nn.Module):
             memory = block(memory, action)
         return self.predictor_norm(memory)
 
-    def decode_memory(self, memory, *, detach=False):
-        """Decode predicted memories; detach only when training the head independently."""
-        logits = self.head(memory.detach() if detach else memory).float()
-        return 15 * torch.tanh(logits/15)
+    def predict_embedding(self, memory, action):
+        """Predict the next token embedding from compressor memory and action."""
+        return self.embedding_output(self.predict_features(memory, action))
+
+    def decode_memory(self, embedding, *, detach=False):
+        """Negative squared distances to vocabulary embeddings (no learned CE head)."""
+        x = (embedding.detach() if detach else embedding).float()
+        vocabulary = self.embedding.weight.float()
+        return -(x.square().sum(-1, keepdim=True)
+                 + vocabulary.square().sum(-1) - 2*x @ vocabulary.T)
 
     def predict_logits(self, memory, action):
-        return self.decode_memory(self.predict_features(memory, action))
+        return self.decode_memory(self.predict_embedding(memory, action))
 
-    def forward(self, idx, targets, *, target_kl, kl_lambda=1., ce_weight=1., mse_weight=1.,
-                memory_loss='smooth_l1', head_training='detached', prediction_horizon=4):
-        if memory_loss not in ('mse', 'smooth_l1'):
-            raise ValueError('memory_loss must be mse or smooth_l1')
-        if not math.isfinite(target_kl) or target_kl < 0:
-            raise ValueError('target_kl must be finite and nonnegative')
-        if not math.isfinite(kl_lambda) or kl_lambda < 0:
-            raise ValueError('kl_lambda must be finite and nonnegative')
-        if not math.isfinite(mse_weight) or mse_weight < 0:
-            raise ValueError('mse_weight must be finite and nonnegative')
-        if head_training not in ('joint', 'detached'):
-            raise ValueError('head_training must be joint or detached')
-        if not isinstance(prediction_horizon, int) or prediction_horizon < 1:
-            raise ValueError('prediction_horizon must be a positive integer')
-        if idx.shape != targets.shape:
-            raise ValueError('idx and targets must have matching [batch, sequence] shapes')
-        h, cache = self.encode(idx)
-        # Include the last target token in the compressor sequence. All future
-        # targets for a given starting memory come from this same sequence.
-        with torch.no_grad():
-            last, _ = self.encode(targets[:, -1:].clamp(min=0), kv_cache=cache)
-        future = torch.cat((h[:, 1:].detach(), last), dim=1)
-        # Infer one-step actions from consecutive *true* compressor memories.
-        # These actions are reused across overlapping recursive rollouts.
-        mean, log_std = self.posterior(h, future)
-        action = mean + log_std.exp()*torch.randn_like(mean)
+    def forward(self, idx, targets, *, target_kl, kl_lambda=1., mse_weight=1.):
+        """Train independent next-token embedding predictions from real prefixes."""
+        for name, value in [('target_kl', target_kl), ('kl_lambda', kl_lambda),
+                            ('mse_weight', mse_weight)]:
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f'{name} must be finite and nonnegative')
+        if idx.ndim != 2 or idx.shape != targets.shape or idx.size(1) < 1:
+            raise ValueError('idx and targets must have matching nonempty [batch, sequence] shapes')
         valid = targets.ne(-1)
-        count = h.new_zeros(())
-        ce_sum, memory_sum = count, count
-        memory_loss_fn = F.mse_loss if memory_loss == 'mse' else F.smooth_l1_loss
-        predicted = h
-        for j in range(1, min(prediction_horizon, h.size(1))+1):
-            n = h.size(1)-j+1
-            # predicted[:, t] represents the rollout starting at true h[:, t].
-            # Only j=1 uses the true starting memory; subsequent steps use
-            # the previous *predicted* memory and the next one-step action.
-            predicted = self.predict_features(predicted[:, :n], action[:, j-1:j-1+n])
-            destination = future[:, j-1:j-1+n]
-            target_ids = targets[:, j-1:j-1+n]
-            # A rollout is valid only if every intermediate target is valid.
-            mask = valid[:, :n].clone()
-            for offset in range(1, j):
-                mask = mask & valid[:, offset:offset+n]
-            masked_ids = target_ids.masked_fill(~mask, -1)
-            logits = self.decode_memory(predicted, detach=(head_training == 'detached'))
-            count = count + mask.sum()
-            ce_sum = ce_sum + F.cross_entropy(logits.reshape(-1, logits.size(-1)), masked_ids.reshape(-1),
-                                                ignore_index=-1, reduction='sum')
-            per_memory = memory_loss_fn(predicted.float(), destination.float(), reduction='none').mean(-1)
-            memory_sum = memory_sum + (per_memory*mask).sum()
-        # KL is charged once per inferred one-step action, not once per rollout
-        # that happens to reuse it.
-        action_count = valid.sum().clamp(min=1)
-        per_dim_kl = 0.5*(mean.float().square() + (2*log_std.float()).exp() - 1 - 2*log_std.float())
-        kl = (per_dim_kl*valid[..., None]).sum()/(action_count*self.config.action_dim)
-        count = count.clamp(min=1)
-        ce = ce_sum/count
-        memory_error = memory_sum/count
-        kl_total = kl*self.config.action_dim
-        kl_excess = F.relu(kl_total-target_kl)
-        kl_penalty = kl_lambda*kl_excess.square()
-        return {'loss': kl_penalty + mse_weight*memory_error, 'ce': ce, 'head_loss': ce_weight*ce, 'memory_loss': memory_error, 'kl': kl,
-                'kl_total': kl_total, 'kl_excess': kl_excess, 'kl_penalty': kl_penalty}
+        teacher = self.embedding(targets.clamp(min=0)).detach()
+        memory, _ = self.encode(idx)
+        mean, log_std = self.posterior(memory, teacher, detach_inputs=False)
+        action = mean + log_std.exp()*torch.randn_like(mean)
+        predicted = self.predict_embedding(memory, action)
+        count = valid.sum().clamp(min=1)
+        error = (predicted.float()-teacher.float()).square().mean(-1)
+        mse = (error*valid).sum()/count
+        kl = 0.5*(mean.float().square() + (2*log_std.float()).exp()-1-2*log_std.float())
+        kl_total = (kl.sum(-1)*valid).sum()/count
+        excess = F.relu(kl_total-target_kl)
+        penalty = kl_lambda*excess.square()
+        return {'loss': mse_weight*mse+penalty, 'embedding_mse': mse,
+                'kl': kl_total/self.config.action_dim, 'kl_total': kl_total,
+                'kl_excess': excess, 'kl_penalty': penalty}
